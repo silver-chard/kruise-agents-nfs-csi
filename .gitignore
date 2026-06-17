@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+/bin/
+/dist/
+/coverage.out
+
+*.log
+*.tmp
+.idea
+.gocache

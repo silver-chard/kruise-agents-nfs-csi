@@ -1,0 +1,4 @@
+Release: {{ .Release.Name }}
+Driver: {{ .Values.driverName }}
+StorageClass: {{ .Values.storageClass.name }}
+Wrapper image: {{ include "kruise-agents-nfs-csi.wrapperImage" . }}

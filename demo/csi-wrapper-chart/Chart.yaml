@@ -1,0 +1,10 @@
+apiVersion: v2
+name: kruise-agents-nfs-csi-wrapper-demo
+description: Demo chart that wraps upstream csi-driver-nfs with an OpenKruise sandbox mount agent.
+type: application
+version: 0.1.0
+appVersion: 0.0.1-beta.12
+dependencies:
+  - name: csi-driver-nfs
+    version: "4.13.2"
+    repository: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts

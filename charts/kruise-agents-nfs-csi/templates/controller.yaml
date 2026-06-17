@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kruise-agents-nfs-csi.fullname" . }}-controller
+  namespace: {{ include "kruise-agents-nfs-csi.namespace" . }}
+  labels:
+    app: {{ include "kruise-agents-nfs-csi.fullname" . }}-controller
+    {{- include "kruise-agents-nfs-csi.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ include "kruise-agents-nfs-csi.fullname" . }}-controller
+  template:
+    metadata:
+      labels:
+        app: {{ include "kruise-agents-nfs-csi.fullname" . }}-controller
+        {{- include "kruise-agents-nfs-csi.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "kruise-agents-nfs-csi.controllerServiceAccount" . }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+{{- toYaml .Values.controller.nodeSelector | nindent 8 }}
+      tolerations:
+{{- toYaml .Values.controller.tolerations | nindent 8 }}
+{{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{- toYaml .Values.imagePullSecrets | nindent 8 }}
+{{- end }}
+      containers:
+        - name: csi-provisioner
+          image: {{ include "kruise-agents-nfs-csi.image" .Values.images.provisioner }}
+          imagePullPolicy: {{ .Values.images.provisioner.pullPolicy }}
+          args:
+            - -v=2
+            - --csi-address=$(ADDRESS)
+            - --leader-election
+            - --leader-election-namespace={{ .Values.controller.leaderElectionNamespace }}
+            - --extra-create-metadata=true
+            - --feature-gates=HonorPVReclaimPolicy=true,VolumeAttributesClass=false
+            - --timeout=1200s
+            - --retry-interval-max=30m
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-resizer
+          image: {{ include "kruise-agents-nfs-csi.image" .Values.images.resizer }}
+          imagePullPolicy: {{ .Values.images.resizer.pullPolicy }}
+          args:
+            - -csi-address=$(ADDRESS)
+            - -v=2
+            - -leader-election
+            - --leader-election-namespace={{ .Values.controller.leaderElectionNamespace }}
+            - -handle-volume-inuse-error=false
+            - -feature-gates=VolumeAttributesClass=false
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: liveness-probe
+          image: {{ include "kruise-agents-nfs-csi.image" .Values.images.livenessProbe }}
+          imagePullPolicy: {{ .Values.images.livenessProbe.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --probe-timeout=3s
+            - --http-endpoint=localhost:29652
+            - --v=2
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: nfs
+          image: {{ include "kruise-agents-nfs-csi.wrapperImage" . }}
+          imagePullPolicy: {{ .Values.images.wrapper.pullPolicy }}
+          args:
+            - --v=5
+            - --nodeid=$(NODE_ID)
+            - --endpoint=$(CSI_ENDPOINT)
+            - --drivername={{ .Values.driverName }}
+            - --mount-permissions=0
+            - --working-mount-dir=/tmp
+            - --default-ondelete-policy=delete
+            - --use-tar-command-in-snapshot=false
+            - --enable-snapshot-compression=true
+          env:
+            - name: WRAPPER_AGENT_ENABLED
+              value: "false"
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ .Values.paths.kubeletPods }}
+            type: Directory
+        - name: socket-dir
+          emptyDir: {}

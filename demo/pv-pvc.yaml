@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-sandbox-nfs-demo
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+    - nordirplus
+  csi:
+    driver: csi.nfs.zhida
+    volumeHandle: sandbox-demo-nfs
+    volumeAttributes:
+      server: nfs.example.internal
+      share: /exports/sandbox
+      subDir: sandbox-demo
+  claimRef:
+    namespace: openkruise-sandbox-demo
+    name: pvc-sandbox-nfs-demo
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-sandbox-nfs-demo
+  namespace: openkruise-sandbox-demo
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: pv-sandbox-nfs-demo
+  resources:
+    requests:
+      storage: 100Gi

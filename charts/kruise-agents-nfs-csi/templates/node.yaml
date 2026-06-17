@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "kruise-agents-nfs-csi.fullname" . }}-node
+  namespace: {{ include "kruise-agents-nfs-csi.namespace" . }}
+  labels:
+    app: {{ include "kruise-agents-nfs-csi.fullname" . }}-node
+    {{- include "kruise-agents-nfs-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "kruise-agents-nfs-csi.fullname" . }}-node
+  template:
+    metadata:
+      labels:
+        app: {{ include "kruise-agents-nfs-csi.fullname" . }}-node
+        {{- include "kruise-agents-nfs-csi.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "kruise-agents-nfs-csi.nodeServiceAccount" . }}
+      hostNetwork: {{ .Values.node.hostNetwork }}
+      hostPID: {{ .Values.node.hostPID }}
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+{{- toYaml .Values.node.nodeSelector | nindent 8 }}
+      tolerations:
+{{- toYaml .Values.node.tolerations | nindent 8 }}
+{{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{- toYaml .Values.imagePullSecrets | nindent 8 }}
+{{- end }}
+      containers:
+        - name: liveness-probe
+          image: {{ include "kruise-agents-nfs-csi.image" .Values.images.livenessProbe }}
+          imagePullPolicy: {{ .Values.images.livenessProbe.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --probe-timeout=3s
+            - --http-endpoint=localhost:29653
+            - --v=2
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: node-driver-registrar
+          image: {{ include "kruise-agents-nfs-csi.image" .Values.images.registrar }}
+          imagePullPolicy: {{ .Values.images.registrar.pullPolicy }}
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+            - --http-endpoint=localhost:19809
+          env:
+            - name: DRIVER_REG_SOCK_PATH
+              value: {{ .Values.paths.pluginDir }}/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: healthz
+              containerPort: 19809
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: nfs
+          image: {{ include "kruise-agents-nfs-csi.wrapperImage" . }}
+          imagePullPolicy: {{ .Values.images.wrapper.pullPolicy }}
+          args:
+            - --v=5
+            - --nodeid=$(NODE_ID)
+            - --endpoint=$(CSI_ENDPOINT)
+            - --drivername={{ .Values.driverName }}
+            - --mount-permissions=0
+          env:
+            - name: WRAPPER_AGENT_ENABLED
+              value: "true"
+            - name: DRIVER_NAME
+              value: {{ .Values.driverName | quote }}
+            - name: TOKEN_AUDIENCE
+              value: {{ .Values.tokenAudience | quote }}
+            - name: WRAPPER_SOCKET_PATH
+              value: {{ .Values.paths.wrapperSocketPath | quote }}
+            - name: WRAPPER_SOCKET_MODE
+              value: {{ .Values.wrapper.socketMode | quote }}
+            - name: WRAPPER_STAGING_ROOT
+              value: {{ .Values.paths.wrapperStagingRoot | quote }}
+            - name: WRAPPER_ENABLE_MOUNT
+              value: {{ .Values.wrapper.enableMount | quote }}
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: Bidirectional
+            - name: wrapper-state
+              mountPath: {{ .Values.paths.wrapperStateDir }}
+              mountPropagation: Bidirectional
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.paths.pluginDir }}
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ .Values.paths.kubeletPods }}
+            type: Directory
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.paths.registrationDir }}
+            type: Directory
+        - name: wrapper-state
+          hostPath:
+            path: {{ .Values.paths.wrapperStateDir }}
+            type: DirectoryOrCreate

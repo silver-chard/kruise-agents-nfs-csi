@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kruise-agents-nfs-csi
+description: Wrap upstream csi-driver-nfs with an OpenKruise sandbox mount agent.
+type: application
+version: 0.1.0
+appVersion: 0.0.1-beta.12

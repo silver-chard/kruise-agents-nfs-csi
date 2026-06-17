@@ -1,0 +1,55 @@
+driverName: csi.nfs.zhida
+tokenAudience: kruise-agents-nfs-csi.zhida/sandbox-mounter
+
+wrapper:
+  serviceAccount:
+    name: csi-nfs-node-sa
+    namespace: kube-system
+  image:
+    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
+    tag: 0.0.1-beta.12
+    pullPolicy: IfNotPresent
+  socketHostPath: /var/lib/kruise-agents-nfs-csi
+  stagingHostPath: /var/lib/kruise-agents-nfs-csi/staging
+  socketPath: /var/lib/kruise-agents-nfs-csi/wrapper.sock
+  socketMode: "0660"
+  enableMount: true
+
+csi-driver-nfs:
+  driver:
+    name: csi.nfs.zhida
+  node:
+    serviceAccount:
+      name: csi-nfs-node-sa
+    dnsPolicy: ClusterFirstWithHostNet
+    hostNetwork: true
+    # The upstream chart values differ by chart version. The intent of this
+    # demo is to replace the nfsplugin node image with wrapper.image while
+    # preserving upstream sidecars, sockets, and CSI behavior.
+    nfs:
+      image:
+        repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
+        tag: 0.0.1-beta.12
+        pullPolicy: IfNotPresent
+      env:
+        - name: DRIVER_NAME
+          value: csi.nfs.zhida
+        - name: TOKEN_AUDIENCE
+          value: kruise-agents-nfs-csi.zhida/sandbox-mounter
+        - name: WRAPPER_SOCKET_PATH
+          value: /var/lib/kruise-agents-nfs-csi/wrapper.sock
+        - name: WRAPPER_SOCKET_MODE
+          value: "0660"
+        - name: WRAPPER_STAGING_ROOT
+          value: /var/lib/kruise-agents-nfs-csi/staging
+        - name: WRAPPER_ENABLE_MOUNT
+          value: "true"
+      extraVolumes:
+        - name: kruise-agents-nfs-csi-state
+          hostPath:
+            path: /var/lib/kruise-agents-nfs-csi
+            type: DirectoryOrCreate
+      extraVolumeMounts:
+        - name: kruise-agents-nfs-csi-state
+          mountPath: /var/lib/kruise-agents-nfs-csi
+          mountPropagation: Bidirectional

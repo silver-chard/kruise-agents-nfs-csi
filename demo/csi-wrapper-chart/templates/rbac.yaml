@@ -1,0 +1,34 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kruise-agents-nfs-csi-wrapper-demo.fullname" . }}
+rules:
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kruise-agents-nfs-csi-wrapper-demo.fullname" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kruise-agents-nfs-csi-wrapper-demo.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.wrapper.serviceAccount.name | quote }}
+    namespace: {{ .Values.wrapper.serviceAccount.namespace | quote }}

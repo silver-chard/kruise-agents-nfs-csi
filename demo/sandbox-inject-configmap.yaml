@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openkruise-nfs-dynamic-mount-inject
+  namespace: openkruise-sandbox-demo
+data:
+  inject.yaml: |
+    driver_name: csi.nfs.zhida
+    wrapper_socket_path: /var/lib/kruise-agents-nfs-csi/wrapper.sock
+    token_audience: kruise-agents-nfs-csi.zhida/sandbox-mounter
+    mounter:
+      image: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-mounter:0.0.1-beta.12
+      restart_policy: Always
+      command:
+        - sh
+        - -c
+      args:
+        - |
+          set -eu
+          cp /usr/local/bin/kruise-nfs-mounter /mnt/envd/sandbox-runtime-storage
+          chmod 0555 /mnt/envd/sandbox-runtime-storage
+          tail -f /dev/null
+      security_context:
+        privileged: false
+        allow_privilege_escalation: false
+        read_only_root_filesystem: true
+        capabilities:
+          drop:
+            - ALL
+      env:
+        - name: DRIVER_NAME
+          value: csi.nfs.zhida
+        - name: WRAPPER_SOCKET_PATH
+          value: /var/lib/kruise-agents-nfs-csi/wrapper.sock
+        - name: PROJECTED_TOKEN_FILE
+          value: /var/run/secrets/kruise-agents-nfs-csi/token
+        - name: POD_NAME
+          value_from:
+            field_ref:
+              field_path: metadata.name
+        - name: POD_NAMESPACE
+          value_from:
+            field_ref:
+              field_path: metadata.namespace
+        - name: POD_UID
+          value_from:
+            field_ref:
+              field_path: metadata.uid
+      volume_mounts:
+        - name: envd-volume
+          mount_path: /mnt/envd
+        - name: kruise-agents-nfs-csi-socket
+          mount_path: /var/lib/kruise-agents-nfs-csi
+          read_only: true
+        - name: kruise-agents-nfs-csi-token
+          mount_path: /var/run/secrets/kruise-agents-nfs-csi
+          read_only: true
+      volumes:
+        - name: envd-volume
+          empty_dir: {}
+        - name: kruise-agents-nfs-csi-socket
+          host_path:
+            path: /var/lib/kruise-agents-nfs-csi
+            type: Directory
+        - name: kruise-agents-nfs-csi-token
+          projected:
+            sources:
+              - service_account_token:
+                  path: token
+                  audience: kruise-agents-nfs-csi.zhida/sandbox-mounter
+                  expiration_seconds: 3600
+              - downward_api:
+                  items:
+                    - path: namespace
+                      field_ref:
+                        field_path: metadata.namespace
+                    - path: pod_name
+                      field_ref:
+                        field_path: metadata.name
+                    - path: pod_uid
+                      field_ref:
+                        field_path: metadata.uid

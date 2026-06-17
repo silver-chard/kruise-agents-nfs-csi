@@ -1,0 +1,89 @@
+fullnameOverride: ""
+namespace: ""
+
+driverName: csi.nfs.zhida
+tokenAudience: kruise-agents-nfs-csi.zhida/sandbox-mounter
+
+imagePullSecrets: []
+
+images:
+  wrapper:
+    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
+    tag: 0.0.1-beta.12
+    pullPolicy: IfNotPresent
+  mounter:
+    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-mounter
+    tag: 0.0.1-beta.12
+    pullPolicy: IfNotPresent
+  provisioner:
+    repository: iregistry.baidu-int.com/cnap-cluster/csi-provisioner
+    tag: v6.1.0
+    pullPolicy: IfNotPresent
+  resizer:
+    repository: iregistry.baidu-int.com/cnap-cluster/csi-resizer
+    tag: v2.0.0
+    pullPolicy: IfNotPresent
+  registrar:
+    repository: iregistry.baidu-int.com/cnap-cluster/csi-node-driver-registrar
+    tag: v2.15.0
+    pullPolicy: IfNotPresent
+  livenessProbe:
+    repository: iregistry.baidu-int.com/cnap-cluster/livenessprobe
+    tag: v2.17.0
+    pullPolicy: IfNotPresent
+
+controller:
+  replicas: 1
+  serviceAccountName: ""
+  leaderElectionNamespace: sandbox-system
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/controlplane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: CriticalAddonsOnly
+      operator: Exists
+      effect: NoSchedule
+
+node:
+  serviceAccountName: ""
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - operator: Exists
+  hostNetwork: true
+  hostPID: true
+
+paths:
+  kubeletPods: /var/lib/kubelet/pods
+  pluginDir: /var/lib/kubelet/plugins/csi-nfs-zhida
+  registrationDir: /var/lib/kubelet/plugins_registry
+  wrapperStateDir: /var/lib/kruise-agents-nfs-csi
+  wrapperSocketPath: /var/lib/kruise-agents-nfs-csi/wrapper.sock
+  wrapperStagingRoot: /var/lib/kruise-agents-nfs-csi/staging
+
+wrapper:
+  enableMount: true
+  socketMode: "0660"
+
+storageClass:
+  create: true
+  name: nfs-csi
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+  volumeBindingMode: Immediate
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+    - nordirplus
+  parameters:
+    mountPermissions: "0755"
+    server: ""
+    share: /

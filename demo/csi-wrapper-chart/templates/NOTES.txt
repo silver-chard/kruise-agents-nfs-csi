@@ -1,0 +1,6 @@
+Driver name: {{ .Values.driverName }}
+Wrapper socket: {{ .Values.wrapper.socketPath }}
+
+This is a demo companion chart for upstream csi-driver-nfs. Confirm the exact
+upstream chart values for your selected csi-driver-nfs chart version before
+using it in a cluster.

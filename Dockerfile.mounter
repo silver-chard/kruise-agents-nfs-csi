@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=iregistry.baidu-int.com/baidu-base/ubuntu:resolute
+
+FROM ${BASE_IMAGE}
+
+COPY dist/linux-amd64/kruise-nfs-mounter /usr/local/bin/kruise-nfs-mounter
+
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/kruise-nfs-mounter"]
