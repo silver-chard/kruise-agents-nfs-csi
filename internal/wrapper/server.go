@@ -84,6 +84,8 @@ func (s *Server) handleMount(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusForbidden
 		if errors.Is(err, errBadRequest) {
 			status = http.StatusBadRequest
+		} else if errors.Is(err, node.ErrBadSourceSubPath) {
+			status = http.StatusBadRequest
 		} else if errors.Is(err, node.ErrMountDisabled) {
 			status = http.StatusServiceUnavailable
 		}
@@ -103,6 +105,11 @@ func (s *Server) mount(ctx context.Context, token string, request api.MountReque
 		return nil, fmt.Errorf("%w: %v", errBadRequest, err)
 	}
 	request.TargetPath = cleanTarget
+	cleanSubPath, err := security.ValidateSourceSubPath(request.SourceSubPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errBadRequest, err)
+	}
+	request.SourceSubPath = cleanSubPath
 
 	tokenStatus, err := s.kube.ReviewToken(ctx, token, []string{s.cfg.TokenAudience})
 	if err != nil {
@@ -155,6 +162,7 @@ func (s *Server) mount(ctx context.Context, token string, request api.MountReque
 		Mounted:       true,
 		DriverName:    s.cfg.DriverName,
 		PVName:        request.PVName,
+		SourceSubPath: request.SourceSubPath,
 		TargetPath:    request.TargetPath,
 		ContainerName: request.ContainerName,
 	}, nil

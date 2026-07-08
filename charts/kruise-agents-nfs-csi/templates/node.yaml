@@ -88,6 +88,8 @@ spec:
               value: {{ .Values.paths.wrapperStagingRoot | quote }}
             - name: WRAPPER_ENABLE_MOUNT
               value: {{ .Values.wrapper.enableMount | quote }}
+            - name: WRAPPER_UNSTAGE_AFTER_MOUNT
+              value: {{ .Values.wrapper.unstageAfterMount | quote }}
             - name: NODE_ID
               valueFrom:
                 fieldRef:

@@ -6,14 +6,18 @@ import (
 	"time"
 )
 
-var ErrMountDisabled = errors.New("node mount is disabled")
+var (
+	ErrMountDisabled    = errors.New("node mount is disabled")
+	ErrBadSourceSubPath = errors.New("bad source subpath")
+)
 
 type Config struct {
-	DriverName   string
-	StagingRoot  string
-	HostProcRoot string
-	EnableMount  bool
-	Timeout      time.Duration
+	DriverName        string
+	StagingRoot       string
+	HostProcRoot      string
+	EnableMount       bool
+	UnstageAfterMount bool
+	Timeout           time.Duration
 }
 
 type PersistentVolume struct {
@@ -30,6 +34,7 @@ type MountPlan struct {
 	PodUID        string
 	ContainerName string
 	ContainerID   string
+	SourceSubPath string
 	TargetPath    string
 }
 

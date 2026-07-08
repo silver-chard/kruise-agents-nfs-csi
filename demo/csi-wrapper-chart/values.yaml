@@ -14,6 +14,7 @@ wrapper:
   socketPath: /var/lib/kruise-agents-nfs-csi/wrapper.sock
   socketMode: "0660"
   enableMount: true
+  unstageAfterMount: true
 
 csi-driver-nfs:
   driver:
@@ -43,6 +44,8 @@ csi-driver-nfs:
         - name: WRAPPER_STAGING_ROOT
           value: /var/lib/kruise-agents-nfs-csi/staging
         - name: WRAPPER_ENABLE_MOUNT
+          value: "true"
+        - name: WRAPPER_UNSTAGE_AFTER_MOUNT
           value: "true"
       extraVolumes:
         - name: kruise-agents-nfs-csi-state

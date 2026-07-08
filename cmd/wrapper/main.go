@@ -30,6 +30,7 @@ func main() {
 	flag.StringVar(&cfg.StagingRoot, "staging-root", cfg.StagingRoot, "node staging root")
 	flag.StringVar(&cfg.HostProcRoot, "host-proc-root", cfg.HostProcRoot, "host proc root visible to wrapper")
 	flag.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
+	flag.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "kruise-nfs-wrapper ", log.LstdFlags|log.LUTC)
@@ -40,12 +41,19 @@ func main() {
 	}
 
 	nodeMounter := node.NewMounter(node.Config{
-		DriverName:   cfg.DriverName,
-		StagingRoot:  cfg.StagingRoot,
-		HostProcRoot: cfg.HostProcRoot,
-		EnableMount:  cfg.EnableMount,
-		Timeout:      cfg.RequestTimeout,
+		DriverName:        cfg.DriverName,
+		StagingRoot:       cfg.StagingRoot,
+		HostProcRoot:      cfg.HostProcRoot,
+		EnableMount:       cfg.EnableMount,
+		UnstageAfterMount: cfg.UnstageAfterMount,
+		Timeout:           cfg.RequestTimeout,
 	})
+	if cfg.UnstageAfterMount {
+		if err := node.CleanupStagingRoot(cfg.StagingRoot); err != nil {
+			logger.Printf("warning: cleanup staging root %s: %v", cfg.StagingRoot, err)
+		}
+	}
+
 	httpServer := &http.Server{
 		Handler: wrapper.NewServer(cfg, kubeClient, nodeMounter, logger),
 	}

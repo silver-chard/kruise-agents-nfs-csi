@@ -21,6 +21,9 @@ func TestParseRuntimeMountRequest(t *testing.T) {
 	raw, err := proto.Marshal(&csi.NodePublishVolumeRequest{
 		VolumeId:   "pvc-1234-abcdef",
 		TargetPath: "/workspace/data",
+		VolumeContext: map[string]string{
+			"source_sub_path": "users/alice",
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal csi request: %v", err)
@@ -49,8 +52,35 @@ func TestParseRuntimeMountRequest(t *testing.T) {
 	if request.TargetPath != "/workspace/data" {
 		t.Fatalf("target path = %q, want /workspace/data", request.TargetPath)
 	}
+	if request.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", request.SourceSubPath)
+	}
 	if request.PodName != "sandbox-pod" || request.Namespace != "sandbox-ns" {
 		t.Fatalf("pod identity = %s/%s, want sandbox-ns/sandbox-pod", request.Namespace, request.PodName)
+	}
+}
+
+func TestParseDirectRequestWithSourceSubPath(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "sandbox-ns")
+	t.Setenv("POD_NAME", "sandbox-pod")
+	t.Setenv("POD_UID", "pod-uid")
+
+	_, request, err := parseRequest([]string{
+		"--driver-name", "csi.nfs.zhida",
+		"--pv", "pv-a",
+		"--sub-path", "users/alice",
+		"--target", "/workspace/data",
+	}, config.MounterConfig{
+		DriverName:  "csi.nfs.zhida",
+		SocketPath:  "/socket.sock",
+		TokenFile:   "/token",
+		HTTPTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("parseRequest returned error: %v", err)
+	}
+	if request.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", request.SourceSubPath)
 	}
 }
 

@@ -71,6 +71,7 @@ paths:
 
 wrapper:
   enableMount: true
+  unstageAfterMount: true
   socketMode: "0660"
 
 storageClass:

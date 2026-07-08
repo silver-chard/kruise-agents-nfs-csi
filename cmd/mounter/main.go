@@ -72,6 +72,7 @@ func parseDirectRequest(args []string, cfg config.MounterConfig) (config.Mounter
 	fs.StringVar(&request.PodName, "pod-name", request.PodName, "requesting pod name")
 	fs.StringVar(&request.PodUID, "pod-uid", request.PodUID, "requesting pod UID")
 	fs.StringVar(&request.PVName, "pv", "", "persistent volume name to mount")
+	fs.StringVar(&request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
 	fs.StringVar(&request.TargetPath, "target", "", "target path inside the business container")
 	fs.StringVar(&request.ContainerName, "container", request.ContainerName, "business container name")
 	if err := fs.Parse(args); err != nil {
@@ -93,6 +94,7 @@ func parseRuntimeMountRequest(args []string, cfg config.MounterConfig) (config.M
 	fs.StringVar(&cfg.TokenFile, "token-file", cfg.TokenFile, "projected service account token file")
 	fs.StringVar(&request.DriverName, "driver", request.DriverName, "CSI driver name")
 	fs.StringVar(&encodedConfig, "config", "", "base64 encoded CSI NodePublishVolumeRequest protobuf")
+	fs.StringVar(&request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
 	fs.StringVar(&request.Namespace, "namespace", request.Namespace, "requesting pod namespace")
 	fs.StringVar(&request.PodName, "pod-name", request.PodName, "requesting pod name")
 	fs.StringVar(&request.PodUID, "pod-uid", request.PodUID, "requesting pod UID")
@@ -115,8 +117,27 @@ func parseRuntimeMountRequest(args []string, cfg config.MounterConfig) (config.M
 	if err != nil {
 		return cfg, api.MountRequest{}, err
 	}
+	if request.SourceSubPath == "" {
+		request.SourceSubPath = sourceSubPathFromNodePublishRequest(csiRequest)
+	}
 	request.TargetPath = csiRequest.TargetPath
 	return cfg, request, nil
+}
+
+func sourceSubPathFromNodePublishRequest(request *csi.NodePublishVolumeRequest) string {
+	if request == nil {
+		return ""
+	}
+	return firstNonEmpty(
+		request.VolumeContext["sourceSubPath"],
+		request.VolumeContext["source_sub_path"],
+		request.VolumeContext["subPath"],
+		request.VolumeContext["sub_path"],
+		request.PublishContext["sourceSubPath"],
+		request.PublishContext["source_sub_path"],
+		request.PublishContext["subPath"],
+		request.PublishContext["sub_path"],
+	)
 }
 
 func defaultMountRequest(cfg config.MounterConfig) api.MountRequest {

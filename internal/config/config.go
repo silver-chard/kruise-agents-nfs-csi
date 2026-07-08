@@ -23,16 +23,17 @@ const (
 )
 
 type WrapperConfig struct {
-	DriverName     string
-	SocketPath     string
-	SocketMode     os.FileMode
-	TokenAudience  string
-	KubeTokenFile  string
-	KubeCAFile     string
-	StagingRoot    string
-	HostProcRoot   string
-	RequestTimeout time.Duration
-	EnableMount    bool
+	DriverName        string
+	SocketPath        string
+	SocketMode        os.FileMode
+	TokenAudience     string
+	KubeTokenFile     string
+	KubeCAFile        string
+	StagingRoot       string
+	HostProcRoot      string
+	RequestTimeout    time.Duration
+	EnableMount       bool
+	UnstageAfterMount bool
 }
 
 type MounterConfig struct {
@@ -58,6 +59,10 @@ func LoadWrapperConfig() WrapperConfig {
 		HostProcRoot:   Env("WRAPPER_HOST_PROC_ROOT", DefaultHostProcRoot),
 		RequestTimeout: DurationEnv("WRAPPER_REQUEST_TIMEOUT", 30*time.Second),
 		EnableMount:    BoolEnv("WRAPPER_ENABLE_MOUNT", true),
+		UnstageAfterMount: BoolEnv(
+			"WRAPPER_UNSTAGE_AFTER_MOUNT",
+			true,
+		),
 	}
 }
 

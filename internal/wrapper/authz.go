@@ -168,6 +168,7 @@ func buildMountPlan(request api.MountRequest, pod *kube.Pod, pv *kube.Persistent
 		PodUID:        pod.Metadata.UID,
 		ContainerName: request.ContainerName,
 		ContainerID:   containerID,
+		SourceSubPath: request.SourceSubPath,
 		TargetPath:    request.TargetPath,
 	}, nil
 }

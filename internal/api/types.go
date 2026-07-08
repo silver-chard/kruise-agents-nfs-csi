@@ -9,6 +9,7 @@ type MountRequest struct {
 	PodName       string `json:"pod_name"`
 	PodUID        string `json:"pod_uid"`
 	PVName        string `json:"pv_name"`
+	SourceSubPath string `json:"source_sub_path,omitempty"`
 	TargetPath    string `json:"target_path"`
 	ContainerName string `json:"container_name,omitempty"`
 }
@@ -17,6 +18,7 @@ type MountResult struct {
 	Mounted       bool   `json:"mounted"`
 	DriverName    string `json:"driver_name"`
 	PVName        string `json:"pv_name"`
+	SourceSubPath string `json:"source_sub_path,omitempty"`
 	TargetPath    string `json:"target_path"`
 	ContainerName string `json:"container_name,omitempty"`
 }

@@ -5,21 +5,27 @@ package node
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 type linuxMounter struct {
-	cfg Config
+	cfg          Config
+	stagingLocks [stagingLockStripes]sync.Mutex
 }
+
+const stagingLockStripes = 128
 
 func NewMounter(cfg Config) Mounter {
 	return &linuxMounter{cfg: cfg}
@@ -39,7 +45,15 @@ func (m *linuxMounter) Mount(ctx context.Context, plan MountPlan) error {
 		return fmt.Errorf("container %s has empty container id", plan.ContainerName)
 	}
 
+	lock := m.stagingLock(plan.PV.Name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	stagePath := filepath.Join(m.cfg.StagingRoot, plan.PV.Name)
+	if m.cfg.UnstageAfterMount {
+		defer warnCleanupStagingPath(stagePath)
+	}
+
 	if err := os.MkdirAll(stagePath, 0o750); err != nil {
 		return fmt.Errorf("create staging path %s: %w", stagePath, err)
 	}
@@ -50,12 +64,112 @@ func (m *linuxMounter) Mount(ctx context.Context, plan MountPlan) error {
 			return err
 		}
 	}
+	sourceFD, sourceDescription, err := openMountSource(stagePath, plan.SourceSubPath)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(sourceFD)
 
 	pid, err := findContainerPID(m.cfg.HostProcRoot, plan.PodUID, plan.ContainerID)
 	if err != nil {
 		return err
 	}
-	return bindMountIntoContainerNamespace(m.cfg.HostProcRoot, pid, stagePath, plan.TargetPath)
+	return bindMountIntoContainerNamespace(m.cfg.HostProcRoot, pid, sourceFD, sourceDescription, plan.TargetPath)
+}
+
+func (m *linuxMounter) stagingLock(key string) *sync.Mutex {
+	hash := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= 16777619
+	}
+	return &m.stagingLocks[hash%stagingLockStripes]
+}
+
+func warnCleanupStagingPath(stagePath string) {
+	if err := cleanupStagingPath(stagePath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup staging path %s: %v\n", stagePath, err)
+	}
+}
+
+func cleanupStagingPath(stagePath string) error {
+	mounted, err := isMountPoint("/proc/self/mountinfo", stagePath)
+	if err != nil {
+		return err
+	}
+	if mounted {
+		if err := unix.Unmount(stagePath, 0); err != nil {
+			return fmt.Errorf("unmount staged path: %w", err)
+		}
+	}
+	if err := os.Remove(stagePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove staged path: %w", err)
+	}
+	return nil
+}
+
+// CleanupStagingRoot unmounts stale per-PV staging mounts left by older wrapper runs.
+func CleanupStagingRoot(stagingRoot string) error {
+	mounts, err := mountPointsUnderRoot("/proc/self/mountinfo", stagingRoot)
+	if err != nil {
+		return err
+	}
+
+	var cleanupErr error
+	for _, mountPath := range mounts {
+		if err := unix.Unmount(mountPath, 0); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("unmount %s: %w", mountPath, err))
+		}
+	}
+
+	entries, err := os.ReadDir(stagingRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cleanupErr
+		}
+		return errors.Join(cleanupErr, fmt.Errorf("read staging root %s: %w", stagingRoot, err))
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(stagingRoot, entry.Name())
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove staging path %s: %w", path, err))
+		}
+	}
+	return cleanupErr
+}
+
+func mountPointsUnderRoot(mountInfoPath, root string) ([]string, error) {
+	file, err := os.Open(mountInfoPath)
+	if err != nil {
+		return nil, fmt.Errorf("open mountinfo %s: %w", mountInfoPath, err)
+	}
+	defer file.Close()
+
+	cleanRoot := filepath.Clean(root)
+	prefix := cleanRoot + string(os.PathSeparator)
+	var mounts []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		mountPath := decodeMountInfoPath(fields[4])
+		if strings.HasPrefix(mountPath, prefix) {
+			mounts = append(mounts, mountPath)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan mountinfo %s: %w", mountInfoPath, err)
+	}
+
+	sort.Slice(mounts, func(i, j int) bool {
+		return len(mounts[i]) > len(mounts[j])
+	})
+	return mounts, nil
 }
 
 func mountNFS(ctx context.Context, pv PersistentVolume, target string) error {
@@ -80,6 +194,46 @@ func mountNFS(ctx context.Context, pv PersistentVolume, target string) error {
 		return fmt.Errorf("mount nfs source for pv %s: %w", pv.Name, err)
 	}
 	return nil
+}
+
+func openMountSource(stagePath, sourceSubPath string) (int, string, error) {
+	if sourceSubPath == "" {
+		fd, err := unix.OpenTree(unix.AT_FDCWD, stagePath, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+		if err != nil {
+			return -1, "", fmt.Errorf("clone staged mount %s: %w", stagePath, err)
+		}
+		return fd, stagePath, nil
+	}
+
+	dirFD, err := unix.Open(stagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, "", fmt.Errorf("open staged mount %s: %w", stagePath, err)
+	}
+	defer unix.Close(dirFD)
+
+	currentFD := dirFD
+	for _, segment := range strings.Split(sourceSubPath, "/") {
+		if segment == "" || segment == "." {
+			continue
+		}
+		nextFD, err := unix.Openat(currentFD, segment, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return -1, "", fmt.Errorf("%w: open source_sub_path %s under staged mount %s: %v", ErrBadSourceSubPath, sourceSubPath, stagePath, err)
+		}
+		if currentFD != dirFD {
+			_ = unix.Close(currentFD)
+		}
+		currentFD = nextFD
+	}
+	if currentFD != dirFD {
+		defer unix.Close(currentFD)
+	}
+
+	fd, err := unix.OpenTree(currentFD, "", unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_EMPTY_PATH)
+	if err != nil {
+		return -1, "", fmt.Errorf("clone staged source_sub_path %s under %s: %w", sourceSubPath, stagePath, err)
+	}
+	return fd, filepath.Join(stagePath, sourceSubPath), nil
 }
 
 func findContainerPID(procRoot, podUID, containerID string) (int, error) {
@@ -118,7 +272,7 @@ func findContainerPID(procRoot, podUID, containerID string) (int, error) {
 	return 0, fmt.Errorf("cannot find process for pod uid %s container %s", podUID, planSafeContainerID(containerID))
 }
 
-func bindMountIntoContainerNamespace(procRoot string, targetPID int, stagePath, targetPath string) error {
+func bindMountIntoContainerNamespace(procRoot string, targetPID, sourceFD int, sourceDescription, targetPath string) error {
 	targetMountInfo := filepath.Join(procRoot, strconv.Itoa(targetPID), "mountinfo")
 	if mounted, err := isMountPoint(targetMountInfo, targetPath); err != nil {
 		return err
@@ -135,12 +289,6 @@ func bindMountIntoContainerNamespace(procRoot string, targetPID int, stagePath, 
 	} else if mounted {
 		return fmt.Errorf("target path %s is already a mount point", targetPath)
 	}
-
-	sourceFD, err := unix.OpenTree(unix.AT_FDCWD, stagePath, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
-	if err != nil {
-		return fmt.Errorf("clone staged mount %s: %w", stagePath, err)
-	}
-	defer unix.Close(sourceFD)
 
 	targetFD, err := unix.Open(targetInContainerRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -173,7 +321,7 @@ func bindMountIntoContainerNamespace(procRoot string, targetPID int, stagePath, 
 	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
 
 	if err := unix.MoveMount(sourceFD, "", targetFD, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
-		return fmt.Errorf("bind mount pv staging path to %s: %w", targetPath, err)
+		return fmt.Errorf("bind mount pv source %s to %s: %w", sourceDescription, targetPath, err)
 	}
 	return nil
 }

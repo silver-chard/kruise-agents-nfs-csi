@@ -3,6 +3,7 @@ package wrapper
 import (
 	"testing"
 
+	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/kube"
 )
 
@@ -79,5 +80,35 @@ func TestSelectContainerStatusUsesSandboxMainContainerEnv(t *testing.T) {
 	}
 	if status.Name != "sandbox-workspace" {
 		t.Fatalf("selected container = %q, want sandbox-workspace", status.Name)
+	}
+}
+
+func TestBuildMountPlanCarriesSourceSubPath(t *testing.T) {
+	pod := &kube.Pod{Metadata: kube.ObjectMeta{Name: "sandbox-pod", Namespace: "sandbox-ns", UID: "pod-uid"}}
+	pv := &kube.PersistentVolume{
+		Metadata: kube.ObjectMeta{Name: "pv-a"},
+		Spec: kube.PersistentVolumeSpec{
+			CSI: &kube.CSIPersistentVolumeSource{
+				VolumeHandle: "handle-a",
+				VolumeAttributes: map[string]string{
+					"server": "nfs.example.internal",
+					"share":  "/exports/workloads",
+				},
+			},
+		},
+	}
+	request := api.MountRequest{
+		PVName:        "pv-a",
+		SourceSubPath: "users/alice",
+		TargetPath:    "/workspace/data",
+		ContainerName: "main",
+	}
+
+	plan, err := buildMountPlan(request, pod, pv, "containerd://container-a")
+	if err != nil {
+		t.Fatalf("buildMountPlan returned error: %v", err)
+	}
+	if plan.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", plan.SourceSubPath)
 	}
 }
