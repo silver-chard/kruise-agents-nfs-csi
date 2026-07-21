@@ -43,20 +43,67 @@ func TestParseRuntimeMountRequest(t *testing.T) {
 		t.Fatalf("parseRequest returned error: %v", err)
 	}
 
-	if request.DriverName != "csi.nfs.zhida" {
-		t.Fatalf("driver name = %q, want csi.nfs.zhida", request.DriverName)
+	if request.Operation != operationMount {
+		t.Fatalf("operation = %q, want mount", request.Operation)
 	}
-	if request.PVName != "pvc-1234" {
-		t.Fatalf("pv name = %q, want pvc-1234", request.PVName)
+	if request.Mount.DriverName != "csi.nfs.zhida" {
+		t.Fatalf("driver name = %q, want csi.nfs.zhida", request.Mount.DriverName)
 	}
-	if request.TargetPath != "/workspace/data" {
-		t.Fatalf("target path = %q, want /workspace/data", request.TargetPath)
+	if request.Mount.PVName != "pvc-1234" {
+		t.Fatalf("pv name = %q, want pvc-1234", request.Mount.PVName)
 	}
-	if request.SourceSubPath != "users/alice" {
-		t.Fatalf("source sub path = %q, want users/alice", request.SourceSubPath)
+	if request.Mount.TargetPath != "/workspace/data" {
+		t.Fatalf("target path = %q, want /workspace/data", request.Mount.TargetPath)
 	}
-	if request.PodName != "sandbox-pod" || request.Namespace != "sandbox-ns" {
-		t.Fatalf("pod identity = %s/%s, want sandbox-ns/sandbox-pod", request.Namespace, request.PodName)
+	if request.Mount.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", request.Mount.SourceSubPath)
+	}
+	if request.Mount.PodName != "sandbox-pod" || request.Mount.Namespace != "sandbox-ns" {
+		t.Fatalf("pod identity = %s/%s, want sandbox-ns/sandbox-pod", request.Mount.Namespace, request.Mount.PodName)
+	}
+}
+
+func TestParseRuntimeUnmountRequest(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "sandbox-ns")
+	t.Setenv("POD_NAME", "sandbox-pod")
+	t.Setenv("POD_UID", "pod-uid")
+
+	raw, err := proto.Marshal(&csi.NodePublishVolumeRequest{
+		VolumeId:   "pvc-1234-abcdef",
+		TargetPath: "/workspace/data",
+		VolumeContext: map[string]string{
+			"source_sub_path": "ignored/on/unmount",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal csi request: %v", err)
+	}
+
+	_, request, err := parseRequest([]string{
+		"unmount",
+		"--driver", "csi.nfs.zhida",
+		"--config", base64.StdEncoding.EncodeToString(raw),
+	}, config.MounterConfig{
+		DriverName:  "csi.nfs.zhida",
+		SocketPath:  "/socket.sock",
+		TokenFile:   "/token",
+		HTTPTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("parseRequest returned error: %v", err)
+	}
+
+	if request.Operation != operationUnmount {
+		t.Fatalf("operation = %q, want unmount", request.Operation)
+	}
+	if request.Mount.PVName != "pvc-1234" {
+		t.Fatalf("pv name = %q, want pvc-1234", request.Mount.PVName)
+	}
+	if request.Mount.TargetPath != "/workspace/data" {
+		t.Fatalf("target path = %q, want /workspace/data", request.Mount.TargetPath)
+	}
+	if request.Mount.SourceSubPath != "" {
+		t.Fatalf("source sub path = %q, want empty", request.Mount.SourceSubPath)
 	}
 }
 
@@ -79,8 +126,41 @@ func TestParseDirectRequestWithSourceSubPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseRequest returned error: %v", err)
 	}
-	if request.SourceSubPath != "users/alice" {
-		t.Fatalf("source sub path = %q, want users/alice", request.SourceSubPath)
+	if request.Mount.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", request.Mount.SourceSubPath)
+	}
+}
+
+func TestParseMountSubcommandWithDirectFlags(t *testing.T) {
+	t.Setenv("POD_NAMESPACE", "sandbox-ns")
+	t.Setenv("POD_NAME", "sandbox-pod")
+	t.Setenv("POD_UID", "pod-uid")
+
+	_, request, err := parseRequest([]string{
+		"mount",
+		"--pv", "pv-a",
+		"--sub-path", "users/alice",
+		"--target", "/workspace/data",
+	}, config.MounterConfig{
+		DriverName:  "csi.nfs.zhida",
+		SocketPath:  "/socket.sock",
+		TokenFile:   "/token",
+		HTTPTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("parseRequest returned error: %v", err)
+	}
+	if request.Operation != operationMount {
+		t.Fatalf("operation = %q, want mount", request.Operation)
+	}
+	if request.Mount.PVName != "pv-a" {
+		t.Fatalf("pv name = %q, want pv-a", request.Mount.PVName)
+	}
+	if request.Mount.TargetPath != "/workspace/data" {
+		t.Fatalf("target path = %q, want /workspace/data", request.Mount.TargetPath)
+	}
+	if request.Mount.SourceSubPath != "users/alice" {
+		t.Fatalf("source sub path = %q, want users/alice", request.Mount.SourceSubPath)
 	}
 }
 

@@ -64,17 +64,54 @@ func (m *linuxMounter) Mount(ctx context.Context, plan MountPlan) error {
 			return err
 		}
 	}
-	sourceFD, sourceDescription, err := openMountSource(stagePath, plan.SourceSubPath)
+	pid, err := findContainerPID(m.cfg.HostProcRoot, plan.PodUID, plan.ContainerID)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(sourceFD)
+
+	if err := m.bindMountWithModernAPI(pid, stagePath, plan.SourceSubPath, plan.TargetPath); err != nil {
+		if !errors.Is(err, unix.ENOSYS) {
+			return err
+		}
+		return m.bindMountWithLegacyAPI(pid, stagePath, plan.SourceSubPath, plan.TargetPath)
+	}
+	return nil
+}
+
+func (m *linuxMounter) Unmount(ctx context.Context, plan MountPlan) error {
+	if !m.cfg.EnableMount {
+		return ErrMountDisabled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if plan.ContainerID == "" {
+		return fmt.Errorf("container %s has empty container id", plan.ContainerName)
+	}
 
 	pid, err := findContainerPID(m.cfg.HostProcRoot, plan.PodUID, plan.ContainerID)
 	if err != nil {
 		return err
 	}
-	return bindMountIntoContainerNamespace(m.cfg.HostProcRoot, pid, sourceFD, sourceDescription, plan.TargetPath)
+	return unmountInContainerNamespace(m.cfg.HostProcRoot, pid, plan.TargetPath)
+}
+
+func (m *linuxMounter) bindMountWithModernAPI(targetPID int, stagePath, sourceSubPath, targetPath string) error {
+	sourceFD, sourceDescription, err := openTreeMountSource(stagePath, sourceSubPath)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(sourceFD)
+	return moveMountIntoContainerNamespace(m.cfg.HostProcRoot, targetPID, sourceFD, sourceDescription, targetPath)
+}
+
+func (m *linuxMounter) bindMountWithLegacyAPI(targetPID int, stagePath, sourceSubPath, targetPath string) error {
+	source, err := openLegacyMountSource(stagePath, sourceSubPath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	return legacyBindMountIntoContainerNamespace(m.cfg.HostProcRoot, targetPID, source.Path(), source.Description, targetPath)
 }
 
 func (m *linuxMounter) stagingLock(key string) *sync.Mutex {
@@ -196,7 +233,7 @@ func mountNFS(ctx context.Context, pv PersistentVolume, target string) error {
 	return nil
 }
 
-func openMountSource(stagePath, sourceSubPath string) (int, string, error) {
+func openTreeMountSource(stagePath, sourceSubPath string) (int, string, error) {
 	if sourceSubPath == "" {
 		fd, err := unix.OpenTree(unix.AT_FDCWD, stagePath, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
 		if err != nil {
@@ -236,6 +273,66 @@ func openMountSource(stagePath, sourceSubPath string) (int, string, error) {
 	return fd, filepath.Join(stagePath, sourceSubPath), nil
 }
 
+type legacyMountSource struct {
+	FD          int
+	Description string
+}
+
+func (s legacyMountSource) Close() {
+	_ = unix.Close(s.FD)
+}
+
+func (s legacyMountSource) Path() string {
+	return filepath.Join("/proc/self/fd", strconv.Itoa(s.FD))
+}
+
+func openLegacyMountSource(stagePath, sourceSubPath string) (legacyMountSource, error) {
+	sourcePath := stagePath
+	if sourceSubPath != "" {
+		sourcePath = filepath.Join(stagePath, sourceSubPath)
+	}
+
+	fd, err := openDirectoryNoFollow(stagePath, sourceSubPath)
+	if err != nil {
+		return legacyMountSource{}, err
+	}
+	return legacyMountSource{FD: fd, Description: sourcePath}, nil
+}
+
+func openDirectoryNoFollow(stagePath, sourceSubPath string) (int, error) {
+	dirFD, err := unix.Open(stagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open staged mount %s: %w", stagePath, err)
+	}
+	if sourceSubPath == "" {
+		return dirFD, nil
+	}
+
+	currentFD := dirFD
+	for _, segment := range strings.Split(sourceSubPath, "/") {
+		if segment == "" || segment == "." {
+			continue
+		}
+		nextFD, err := unix.Openat(currentFD, segment, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			if currentFD != dirFD {
+				_ = unix.Close(currentFD)
+			}
+			_ = unix.Close(dirFD)
+			return -1, fmt.Errorf("%w: open source_sub_path %s under staged mount %s: %v", ErrBadSourceSubPath, sourceSubPath, stagePath, err)
+		}
+		if currentFD != dirFD {
+			_ = unix.Close(currentFD)
+		}
+		currentFD = nextFD
+	}
+	if currentFD == dirFD {
+		return dirFD, nil
+	}
+	_ = unix.Close(dirFD)
+	return currentFD, nil
+}
+
 func findContainerPID(procRoot, podUID, containerID string) (int, error) {
 	normalizedID := normalizeContainerID(containerID)
 	if normalizedID == "" {
@@ -272,7 +369,7 @@ func findContainerPID(procRoot, podUID, containerID string) (int, error) {
 	return 0, fmt.Errorf("cannot find process for pod uid %s container %s", podUID, planSafeContainerID(containerID))
 }
 
-func bindMountIntoContainerNamespace(procRoot string, targetPID, sourceFD int, sourceDescription, targetPath string) error {
+func moveMountIntoContainerNamespace(procRoot string, targetPID, sourceFD int, sourceDescription, targetPath string) error {
 	targetMountInfo := filepath.Join(procRoot, strconv.Itoa(targetPID), "mountinfo")
 	if mounted, err := isMountPoint(targetMountInfo, targetPath); err != nil {
 		return err
@@ -322,6 +419,142 @@ func bindMountIntoContainerNamespace(procRoot string, targetPID, sourceFD int, s
 
 	if err := unix.MoveMount(sourceFD, "", targetFD, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
 		return fmt.Errorf("bind mount pv source %s to %s: %w", sourceDescription, targetPath, err)
+	}
+	return nil
+}
+
+func unmountInContainerNamespace(procRoot string, targetPID int, targetPath string) error {
+	targetMountInfo := filepath.Join(procRoot, strconv.Itoa(targetPID), "mountinfo")
+	if mounted, err := isMountPoint(targetMountInfo, targetPath); err != nil {
+		return err
+	} else if !mounted {
+		return fmt.Errorf("target path %s is not a mount point", targetPath)
+	}
+
+	targetRoot, err := unix.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "root"), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open target container root for pid %d: %w", targetPID, err)
+	}
+	defer unix.Close(targetRoot)
+
+	selfRoot, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open current root: %w", err)
+	}
+	defer unix.Close(selfRoot)
+
+	selfCWD, err := unix.Open(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open current working directory: %w", err)
+	}
+	defer unix.Close(selfCWD)
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := unshareFS(); err != nil {
+		return fmt.Errorf("unshare filesystem attributes: %w", err)
+	}
+
+	selfMountNS, err := os.Open(filepath.Join(procRoot, "self", "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("open current mount namespace: %w", err)
+	}
+	defer selfMountNS.Close()
+
+	targetMountNS, err := os.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("open target mount namespace for pid %d: %w", targetPID, err)
+	}
+	defer targetMountNS.Close()
+
+	if err := setns(int(targetMountNS.Fd()), syscall.CLONE_NEWNS); err != nil {
+		return fmt.Errorf("enter target mount namespace for pid %d: %w", targetPID, err)
+	}
+	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
+
+	if err := enterRoot(targetRoot); err != nil {
+		return fmt.Errorf("enter target root for pid %d: %w", targetPID, err)
+	}
+	defer restoreRoot(selfRoot, selfCWD)
+
+	if err := unix.Unmount(targetPath, 0); err != nil {
+		return fmt.Errorf("unmount target path %s: %w", targetPath, err)
+	}
+	return nil
+}
+
+func enterRoot(rootFD int) error {
+	if err := unix.Fchdir(rootFD); err != nil {
+		return fmt.Errorf("change directory to root fd: %w", err)
+	}
+	if err := unix.Chroot("."); err != nil {
+		return fmt.Errorf("chroot: %w", err)
+	}
+	if err := unix.Chdir("/"); err != nil {
+		return fmt.Errorf("change directory to /: %w", err)
+	}
+	return nil
+}
+
+func restoreRoot(rootFD, cwdFD int) {
+	if err := unix.Fchdir(rootFD); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore root directory: %v\n", err)
+		return
+	}
+	if err := unix.Chroot("."); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore root: %v\n", err)
+		return
+	}
+	if err := unix.Fchdir(cwdFD); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore working directory: %v\n", err)
+	}
+}
+
+func legacyBindMountIntoContainerNamespace(procRoot string, targetPID int, sourcePath, sourceDescription, targetPath string) error {
+	targetMountInfo := filepath.Join(procRoot, strconv.Itoa(targetPID), "mountinfo")
+	if mounted, err := isMountPoint(targetMountInfo, targetPath); err != nil {
+		return err
+	} else if mounted {
+		return fmt.Errorf("target path %s is already a mount point", targetPath)
+	}
+
+	targetInContainerRoot := filepath.Join(procRoot, strconv.Itoa(targetPID), "root", strings.TrimPrefix(targetPath, "/"))
+	if err := os.MkdirAll(targetInContainerRoot, 0o755); err != nil {
+		return fmt.Errorf("create target path %s: %w", targetPath, err)
+	}
+	if mounted, err := isMountPoint(targetMountInfo, targetPath); err != nil {
+		return err
+	} else if mounted {
+		return fmt.Errorf("target path %s is already a mount point", targetPath)
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := unshareFS(); err != nil {
+		return fmt.Errorf("unshare filesystem attributes: %w", err)
+	}
+
+	selfMountNS, err := os.Open(filepath.Join(procRoot, "self", "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("open current mount namespace: %w", err)
+	}
+	defer selfMountNS.Close()
+
+	targetMountNS, err := os.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("open target mount namespace for pid %d: %w", targetPID, err)
+	}
+	defer targetMountNS.Close()
+
+	if err := setns(int(targetMountNS.Fd()), syscall.CLONE_NEWNS); err != nil {
+		return fmt.Errorf("enter target mount namespace for pid %d: %w", targetPID, err)
+	}
+	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
+
+	if err := unix.Mount(sourcePath, targetInContainerRoot, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind mount pv source %s to %s with legacy mount API: %w", sourceDescription, targetPath, err)
 	}
 	return nil
 }

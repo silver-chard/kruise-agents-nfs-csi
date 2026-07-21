@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/config"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -28,9 +28,9 @@ func main() {
 		exitError(err)
 	}
 
-	request = completePodIdentity(request, cfg)
+	request.Mount = completePodIdentity(request.Mount, cfg)
 
-	if err := validateCLIRequest(request); err != nil {
+	if err := validateCLIRequest(request.Mount); err != nil {
 		exitError(err)
 	}
 
@@ -54,74 +54,135 @@ func main() {
 	}
 }
 
-func parseRequest(args []string, cfg config.MounterConfig) (config.MounterConfig, api.MountRequest, error) {
-	if len(args) > 0 && args[0] == "mount" {
-		return parseRuntimeMountRequest(args[1:], cfg)
-	}
-	return parseDirectRequest(args, cfg)
+type operation string
+
+const (
+	operationMount   operation = "mount"
+	operationUnmount operation = "unmount"
+)
+
+type cliRequest struct {
+	Operation operation
+	Mount     api.MountRequest
 }
 
-func parseDirectRequest(args []string, cfg config.MounterConfig) (config.MounterConfig, api.MountRequest, error) {
-	request := defaultMountRequest(cfg)
-	fs := flag.NewFlagSet("kruise-nfs-mounter", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "wrapper Unix socket path")
-	fs.StringVar(&cfg.TokenFile, "token-file", cfg.TokenFile, "projected service account token file")
-	fs.StringVar(&request.DriverName, "driver-name", request.DriverName, "CSI driver name")
-	fs.StringVar(&request.Namespace, "namespace", request.Namespace, "requesting pod namespace")
-	fs.StringVar(&request.PodName, "pod-name", request.PodName, "requesting pod name")
-	fs.StringVar(&request.PodUID, "pod-uid", request.PodUID, "requesting pod UID")
-	fs.StringVar(&request.PVName, "pv", "", "persistent volume name to mount")
-	fs.StringVar(&request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
-	fs.StringVar(&request.TargetPath, "target", "", "target path inside the business container")
-	fs.StringVar(&request.ContainerName, "container", request.ContainerName, "business container name")
-	if err := fs.Parse(args); err != nil {
-		return cfg, api.MountRequest{}, err
-	}
-	if fs.NArg() != 0 {
-		return cfg, api.MountRequest{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
-	}
-	return cfg, request, nil
+type commandState struct {
+	cfg           config.MounterConfig
+	request       api.MountRequest
+	operation     operation
+	encodedConfig string
 }
 
-func parseRuntimeMountRequest(args []string, cfg config.MounterConfig) (config.MounterConfig, api.MountRequest, error) {
-	request := defaultMountRequest(cfg)
-	var encodedConfig string
+func parseRequest(args []string, cfg config.MounterConfig) (config.MounterConfig, cliRequest, error) {
+	state := commandState{
+		cfg:       cfg,
+		request:   defaultMountRequest(cfg),
+		operation: operationMount,
+	}
+	root := newRootCommand(&state)
+	root.SetArgs(args)
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.Execute(); err != nil {
+		return state.cfg, cliRequest{}, err
+	}
+	return state.cfg, cliRequest{Operation: state.operation, Mount: state.request}, nil
+}
 
-	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	fs.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "wrapper Unix socket path")
-	fs.StringVar(&cfg.TokenFile, "token-file", cfg.TokenFile, "projected service account token file")
-	fs.StringVar(&request.DriverName, "driver", request.DriverName, "CSI driver name")
-	fs.StringVar(&encodedConfig, "config", "", "base64 encoded CSI NodePublishVolumeRequest protobuf")
-	fs.StringVar(&request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
-	fs.StringVar(&request.Namespace, "namespace", request.Namespace, "requesting pod namespace")
-	fs.StringVar(&request.PodName, "pod-name", request.PodName, "requesting pod name")
-	fs.StringVar(&request.PodUID, "pod-uid", request.PodUID, "requesting pod UID")
-	fs.StringVar(&request.ContainerName, "container", request.ContainerName, "business container name")
-	if err := fs.Parse(args); err != nil {
-		return cfg, api.MountRequest{}, err
-	}
-	if fs.NArg() != 0 {
-		return cfg, api.MountRequest{}, fmt.Errorf("unexpected mount arguments: %s", strings.Join(fs.Args(), " "))
-	}
-	if encodedConfig == "" {
-		return cfg, api.MountRequest{}, fmt.Errorf("config is required")
+func newRootCommand(state *commandState) *cobra.Command {
+	root := &cobra.Command{
+		Use:           "kruise-nfs-mounter",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) != 0 {
+				return fmt.Errorf("unexpected arguments: %s", strings.Join(args, " "))
+			}
+			state.operation = operationMount
+			return nil
+		},
 	}
 
+	bindCommonFlags(root, state)
+	root.Flags().StringVar(&state.request.PVName, "pv", "", "persistent volume name to mount")
+	root.Flags().StringVar(&state.request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
+	root.Flags().StringVar(&state.request.TargetPath, "target", "", "target path inside the business container")
+	root.Flags().StringVar(&state.request.ContainerName, "container", state.request.ContainerName, "business container name")
+
+	mountCommand := &cobra.Command{
+		Use:           "mount",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) != 0 {
+				return fmt.Errorf("unexpected mount arguments: %s", strings.Join(args, " "))
+			}
+			state.operation = operationMount
+			if state.encodedConfig == "" {
+				return nil
+			}
+			return applyNodePublishConfig(&state.request, state.encodedConfig, true)
+		},
+	}
+	bindCommonFlags(mountCommand, state)
+	mountCommand.Flags().StringVar(&state.encodedConfig, "config", "", "base64 encoded CSI NodePublishVolumeRequest protobuf")
+	mountCommand.Flags().StringVar(&state.request.PVName, "pv", "", "persistent volume name to mount")
+	mountCommand.Flags().StringVar(&state.request.SourceSubPath, "sub-path", "", "directory subPath inside the persistent volume")
+	mountCommand.Flags().StringVar(&state.request.TargetPath, "target", "", "target path inside the business container")
+	mountCommand.Flags().StringVar(&state.request.ContainerName, "container", state.request.ContainerName, "business container name")
+
+	unmountCommand := &cobra.Command{
+		Use:           "unmount",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) != 0 {
+				return fmt.Errorf("unexpected unmount arguments: %s", strings.Join(args, " "))
+			}
+			state.operation = operationUnmount
+			if state.encodedConfig != "" {
+				if err := applyNodePublishConfig(&state.request, state.encodedConfig, false); err != nil {
+					return err
+				}
+			}
+			state.request.SourceSubPath = ""
+			return nil
+		},
+	}
+	bindCommonFlags(unmountCommand, state)
+	unmountCommand.Flags().StringVar(&state.encodedConfig, "config", "", "base64 encoded CSI NodePublishVolumeRequest protobuf")
+	unmountCommand.Flags().StringVar(&state.request.PVName, "pv", "", "persistent volume name to unmount")
+	unmountCommand.Flags().StringVar(&state.request.TargetPath, "target", "", "target path inside the business container")
+	unmountCommand.Flags().StringVar(&state.request.ContainerName, "container", state.request.ContainerName, "business container name")
+
+	root.AddCommand(mountCommand, unmountCommand)
+	return root
+}
+
+func bindCommonFlags(command *cobra.Command, state *commandState) {
+	command.Flags().StringVar(&state.cfg.SocketPath, "socket-path", state.cfg.SocketPath, "wrapper Unix socket path")
+	command.Flags().StringVar(&state.cfg.TokenFile, "token-file", state.cfg.TokenFile, "projected service account token file")
+	command.Flags().StringVar(&state.request.DriverName, "driver", state.request.DriverName, "CSI driver name")
+	command.Flags().StringVar(&state.request.DriverName, "driver-name", state.request.DriverName, "CSI driver name")
+	command.Flags().StringVar(&state.request.Namespace, "namespace", state.request.Namespace, "requesting pod namespace")
+	command.Flags().StringVar(&state.request.PodName, "pod-name", state.request.PodName, "requesting pod name")
+	command.Flags().StringVar(&state.request.PodUID, "pod-uid", state.request.PodUID, "requesting pod UID")
+}
+
+func applyNodePublishConfig(request *api.MountRequest, encodedConfig string, includeSubPath bool) error {
 	csiRequest, err := decodeNodePublishVolumeRequest(encodedConfig)
 	if err != nil {
-		return cfg, api.MountRequest{}, err
+		return err
 	}
 	request.PVName, err = pvNameFromNodePublishRequest(csiRequest)
 	if err != nil {
-		return cfg, api.MountRequest{}, err
+		return err
 	}
-	if request.SourceSubPath == "" {
+	if includeSubPath && request.SourceSubPath == "" {
 		request.SourceSubPath = sourceSubPathFromNodePublishRequest(csiRequest)
 	}
 	request.TargetPath = csiRequest.TargetPath
-	return cfg, request, nil
+	return nil
 }
 
 func sourceSubPathFromNodePublishRequest(request *csi.NodePublishVolumeRequest) string {
@@ -235,10 +296,32 @@ func validateCLIRequest(request api.MountRequest) error {
 	return nil
 }
 
-func callWrapper(ctx context.Context, cfg config.MounterConfig, token string, request api.MountRequest) (*api.MountResult, error) {
-	payload, err := json.Marshal(request)
+func callWrapper(ctx context.Context, cfg config.MounterConfig, token string, request cliRequest) (any, error) {
+	var endpoint string
+	var payloadRequest any
+	switch request.Operation {
+	case operationMount:
+		endpoint = "/v1/mount"
+		payloadRequest = request.Mount
+	case operationUnmount:
+		endpoint = "/v1/unmount"
+		payloadRequest = api.UnmountRequest{
+			APIVersion:    request.Mount.APIVersion,
+			DriverName:    request.Mount.DriverName,
+			Namespace:     request.Mount.Namespace,
+			PodName:       request.Mount.PodName,
+			PodUID:        request.Mount.PodUID,
+			PVName:        request.Mount.PVName,
+			TargetPath:    request.Mount.TargetPath,
+			ContainerName: request.Mount.ContainerName,
+		}
+	default:
+		return nil, fmt.Errorf("unsupported operation %q", request.Operation)
+	}
+
+	payload, err := json.Marshal(payloadRequest)
 	if err != nil {
-		return nil, fmt.Errorf("marshal mount request: %w", err)
+		return nil, fmt.Errorf("marshal %s request: %w", request.Operation, err)
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -248,7 +331,7 @@ func callWrapper(ctx context.Context, cfg config.MounterConfig, token string, re
 	}
 	client := http.Client{Transport: transport, Timeout: cfg.HTTPTimeout}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/v1/mount", bytes.NewReader(payload))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix"+endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("create wrapper request: %w", err)
 	}
@@ -268,22 +351,33 @@ func callWrapper(ctx context.Context, cfg config.MounterConfig, token string, re
 	}
 
 	var apiResponse struct {
-		Data  *api.MountResult `json:"data,omitempty"`
-		Error string           `json:"error,omitempty"`
+		Data  json.RawMessage `json:"data,omitempty"`
+		Error string          `json:"error,omitempty"`
 	}
 	if err := json.Unmarshal(body, &apiResponse); err != nil {
 		return nil, fmt.Errorf("decode wrapper response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if apiResponse.Error != "" {
-			return nil, fmt.Errorf("wrapper rejected mount request: %s", apiResponse.Error)
+			return nil, fmt.Errorf("wrapper rejected %s request: %s", request.Operation, apiResponse.Error)
 		}
-		return nil, fmt.Errorf("wrapper rejected mount request with status %s", response.Status)
+		return nil, fmt.Errorf("wrapper rejected %s request with status %s", request.Operation, response.Status)
 	}
-	if apiResponse.Data == nil {
+	if len(apiResponse.Data) == 0 {
 		return nil, fmt.Errorf("wrapper response did not include data")
 	}
-	return apiResponse.Data, nil
+	if request.Operation == operationUnmount {
+		var result api.UnmountResult
+		if err := json.Unmarshal(apiResponse.Data, &result); err != nil {
+			return nil, fmt.Errorf("decode wrapper unmount result: %w", err)
+		}
+		return &result, nil
+	}
+	var result api.MountResult
+	if err := json.Unmarshal(apiResponse.Data, &result); err != nil {
+		return nil, fmt.Errorf("decode wrapper mount result: %w", err)
+	}
+	return &result, nil
 }
 
 func readFirstExistingFile(paths ...string) string {

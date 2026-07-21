@@ -29,6 +29,12 @@ Authentication header:
 Authorization: Bearer <projected-service-account-token>
 ```
 
+Unmount uses the same identity and authorization model:
+
+```text
+kruise-nfs-mounter unmount --driver csi.nfs.zhida --config <base64 NodePublishVolumeRequest>
+```
+
 ## POST /v1/mount
 
 Request:
@@ -69,3 +75,37 @@ Failure:
   "error": "pv pv-sandbox-nfs-demo uses driver nfs.csi.k8s.io, expected csi.nfs.zhida"
 }
 ```
+
+## POST /v1/unmount
+
+Request:
+
+```json
+{
+  "api_version": "kruise-agents-nfs-csi.zhida/v1alpha1",
+  "driver_name": "csi.nfs.zhida",
+  "namespace": "example",
+  "pod_name": "sandbox-demo-0",
+  "pod_uid": "00000000-0000-0000-0000-000000000000",
+  "pv_name": "pv-sandbox-nfs-demo",
+  "target_path": "/workspace/data",
+  "container_name": "main"
+}
+```
+
+Success:
+
+```json
+{
+  "data": {
+    "unmounted": true,
+    "driver_name": "csi.nfs.zhida",
+    "pv_name": "pv-sandbox-nfs-demo",
+    "target_path": "/workspace/data",
+    "container_name": "main"
+  }
+}
+```
+
+The wrapper rejects unmount when the requested target path is not currently a
+mount point in the target container mount namespace.

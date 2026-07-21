@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 REGISTRY="${REGISTRY:-iregistry.baidu-int.com/cnap-cluster}"
-VERSION="${VERSION:-0.0.1-beta.12}"
+VERSION="${VERSION:-0.0.7}"
 BASE_IMAGE="${BASE_IMAGE:-iregistry.baidu-int.com/baidu-base/ubuntu:resolute}"
 UPSTREAM_NFS_CSI_IMAGE="${UPSTREAM_NFS_CSI_IMAGE:-iregistry.baidu-int.com/cnap-cluster/nfsplugin:v4.13.2}"
 GO_CACHE="${GO_CACHE:-/private/tmp/kruise-agents-nfs-csi-gocache}"

@@ -54,8 +54,9 @@ The dangerous operations are concentrated in the node DaemonSet wrapper:
 - the wrapper only allows the configured CSI driver;
 - the wrapper rejects dangerous target paths such as `/`, `/proc`, `/sys`,
   `/dev`, and Kubernetes secret paths;
-- if the target path is already a mount point, the wrapper returns an error and
-  does not unmount it.
+- if the target path is already a mount point during mount, the wrapper returns
+  an error and does not unmount it automatically;
+- active unmount is exposed as a separate authenticated wrapper operation.
 
 See [docs/security-model.md](docs/security-model.md) for details.
 

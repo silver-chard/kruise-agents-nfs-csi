@@ -21,3 +21,7 @@ func CleanupStagingRoot(string) error {
 func (unsupportedMounter) Mount(context.Context, MountPlan) error {
 	return fmt.Errorf("node mount is only supported on linux")
 }
+
+func (unsupportedMounter) Unmount(context.Context, MountPlan) error {
+	return fmt.Errorf("node unmount is only supported on linux")
+}

@@ -40,4 +40,5 @@ type MountPlan struct {
 
 type Mounter interface {
 	Mount(ctx context.Context, plan MountPlan) error
+	Unmount(ctx context.Context, plan MountPlan) error
 }
