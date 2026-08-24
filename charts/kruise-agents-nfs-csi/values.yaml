@@ -68,10 +68,13 @@ paths:
   wrapperStateDir: /var/lib/kruise-agents-nfs-csi
   wrapperSocketPath: /var/lib/kruise-agents-nfs-csi/wrapper.sock
   wrapperStagingRoot: /var/lib/kruise-agents-nfs-csi/staging
+  wrapperMountStateDir: /var/lib/kruise-agents-nfs-csi/mounts
 
 wrapper:
   enableMount: true
   unstageAfterMount: true
+  socketGroup: 2000
+  socketDirMode: "0770"
   socketMode: "0660"
 
 storageClass:

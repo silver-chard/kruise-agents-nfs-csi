@@ -29,7 +29,29 @@ spec:
       imagePullSecrets:
 {{- toYaml .Values.imagePullSecrets | nindent 8 }}
 {{- end }}
-      containers:
+      initContainers:
+        - name: prepare-wrapper-state
+          image: {{ include "kruise-agents-nfs-csi.wrapperImage" . }}
+          imagePullPolicy: {{ .Values.images.wrapper.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p {{ .Values.paths.wrapperStateDir | quote }} {{ .Values.paths.wrapperStagingRoot | quote }} {{ .Values.paths.wrapperMountStateDir | quote }}
+              chown 0:{{ .Values.wrapper.socketGroup }} {{ .Values.paths.wrapperStateDir | quote }}
+              chmod {{ .Values.wrapper.socketDirMode }} {{ .Values.paths.wrapperStateDir | quote }}
+              chmod 0750 {{ .Values.paths.wrapperMountStateDir | quote }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+              drop: ["ALL"]
+          volumeMounts:
+            - name: wrapper-state
+              mountPath: {{ .Values.paths.wrapperStateDir }}
         - name: liveness-probe
           image: {{ include "kruise-agents-nfs-csi.image" .Values.images.livenessProbe }}
           imagePullPolicy: {{ .Values.images.livenessProbe.pullPolicy }}
@@ -86,6 +108,12 @@ spec:
               value: {{ .Values.wrapper.socketMode | quote }}
             - name: WRAPPER_STAGING_ROOT
               value: {{ .Values.paths.wrapperStagingRoot | quote }}
+            - name: WRAPPER_MOUNT_STATE_DIR
+              value: {{ .Values.paths.wrapperMountStateDir | quote }}
+            - name: WRAPPER_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: WRAPPER_ENABLE_MOUNT
               value: {{ .Values.wrapper.enableMount | quote }}
             - name: WRAPPER_UNSTAGE_AFTER_MOUNT
@@ -98,6 +126,8 @@ spec:
               value: unix:///csi/csi.sock
           securityContext:
             privileged: true
+            runAsUser: 0
+            runAsGroup: {{ .Values.wrapper.socketGroup }}
             allowPrivilegeEscalation: true
             capabilities:
               add: ["SYS_ADMIN"]

@@ -28,6 +28,8 @@ func main() {
 	flag.StringVar(&cfg.KubeTokenFile, "kube-token-file", cfg.KubeTokenFile, "wrapper service account token file")
 	flag.StringVar(&cfg.KubeCAFile, "kube-ca-file", cfg.KubeCAFile, "Kubernetes CA file")
 	flag.StringVar(&cfg.StagingRoot, "staging-root", cfg.StagingRoot, "node staging root")
+	flag.StringVar(&cfg.MountStateDir, "mount-state-dir", cfg.MountStateDir, "persistent desired mount state directory")
+	flag.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name used to watch local pods")
 	flag.StringVar(&cfg.HostProcRoot, "host-proc-root", cfg.HostProcRoot, "host proc root visible to wrapper")
 	flag.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
 	flag.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
@@ -54,8 +56,12 @@ func main() {
 		}
 	}
 
+	wrapperServer, err := wrapper.NewServer(cfg, kubeClient, nodeMounter, logger)
+	if err != nil {
+		logger.Fatalf("create wrapper server: %v", err)
+	}
 	httpServer := &http.Server{
-		Handler: wrapper.NewServer(cfg, kubeClient, nodeMounter, logger),
+		Handler: wrapperServer,
 	}
 
 	listener, err := listenUnix(cfg.SocketPath, cfg.SocketMode)
@@ -65,6 +71,9 @@ func main() {
 	logger.Printf("listening on %s for driver %s", cfg.SocketPath, cfg.DriverName)
 
 	errCh := make(chan error, 1)
+	reconcileCtx, stopReconciler := context.WithCancel(context.Background())
+	defer stopReconciler()
+	go wrapperServer.RunReconciler(reconcileCtx)
 	go func() {
 		errCh <- httpServer.Serve(listener)
 	}()
@@ -75,12 +84,14 @@ func main() {
 	select {
 	case sig := <-signalCh:
 		logger.Printf("received signal %s, shutting down", sig)
+		stopReconciler()
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
 			logger.Printf("shutdown failed: %v", err)
 		}
 	case err := <-errCh:
+		stopReconciler()
 		if !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatalf("server failed: %v", err)
 		}

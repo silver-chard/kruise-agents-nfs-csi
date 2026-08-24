@@ -153,21 +153,17 @@ Kubernetes API
 
 ### 动态卸载时序
 
-【代码事实】当前代码没有实现 `/v1/unmount` 或目标容器路径 unmount API。当前“卸载”只覆盖两类 staging cleanup：
+【代码事实】当前实现提供认证后的 `/v1/unmount` 和 `kruise-nfs-mounter unmount`。卸载时序为：
 
-- 每次 mount 后，如果 `UnstageAfterMount` 开启，清理 wrapper staging path。
-- wrapper 启动时调用 `node.CleanupStagingRoot` 清理旧 wrapper 进程遗留的 staging mounts，见 `cmd/wrapper/main.go:52` 与 `internal/node/mounter_linux.go:107`。
+- 重复 TokenReview、Pod/PV/PVC、driver、target path 和目标容器校验。
+- 先从节点状态目录删除对应的期望挂载文件，避免 informer 重协调把目标重新挂回。
+- 重新定位当前目标容器 PID 和 mount namespace；目标仍为 mount point 时进入该 namespace 卸载。
+- 目标已经不存在时返回成功，使容器重启窗口内的 unmount 也能取消期望挂载。
+- unmount 失败时恢复原期望状态，避免状态与实际挂载静默分叉。
 
-【设计规划】目标容器内的动态卸载如果需要实现，建议时序为：
+【代码事实】staging cleanup 仍包含两条独立路径：每次 mount 后按 `UnstageAfterMount` 清理，以及 wrapper 启动时调用 `node.CleanupStagingRoot` 清理旧进程遗留的 staging mounts。
 
-1. runtime/controller 发起 unmount 请求，携带与 mount 相同的 Pod/PV/target/container identity。
-2. wrapper 重复 TokenReview、Pod/PV/PVC、driver、target path 校验。
-3. wrapper 重新定位目标容器 PID 和 mount namespace。
-4. wrapper 校验目标路径确实是本 wrapper 对应 PV/source 的挂载点。
-5. wrapper 在目标 mount namespace 内只卸载该目标路径，并记录结果。
-6. wrapper 触发状态重协调，处理 Pod 已退出、PID 已消失、mount 已不存在等情况。
-
-【设计规划】上面的目标 unmount 尚未编码，不能视为当前实现能力。
+【设计规划】当前 mountinfo 检查只能确认 target 是 mount point；如需对无本地状态的历史挂载做更强卸载校验，还应核对实际 mount source 与请求 PV/source 一致。
 
 ## 6. 容器身份校验和 mount namespace 获取方法
 
@@ -209,9 +205,7 @@ Kubernetes API
 
 【代码事实】对同一 PV 的 staging 操作有 128 条 stripe lock，避免同一 PV 并发 staging/unstaging 互相干扰，见 `internal/node/mounter_linux.go:22` 与 `stagingLock`。
 
-【代码事实】如果 staging path 已经是 mount point，当前实现复用 staging mount；如果目标路径已经是 mount point，当前实现返回错误。因此“重复请求同一路径”不是成功幂等，而是显式拒绝。
-
-【设计规划】如果需要面向 runtime 的幂等语义，可以在 wrapper 记录 `(pod_uid, container_id, pv_name, target_path)` 状态，并在重复请求时校验已有挂载与请求一致后返回成功。当前代码没有状态表。
+【代码事实】如果 staging path 已经是 mount point，当前实现复用 staging mount。wrapper 会持久化 `(pod_uid, container_name, target_path)` 对应的期望挂载和最近成功的 container ID；同一挂载意图、同一 container ID 且目标仍为 mount point 时，重复请求直接返回成功。未知的已有 mount point 仍由 node mounter 显式拒绝，不会覆盖。
 
 ### 回滚
 
@@ -223,14 +217,7 @@ Kubernetes API
 
 ### 状态重协调
 
-【代码事实】当前只有 wrapper 启动时对 staging root 的清理，见 `CleanupStagingRoot`。没有 controller watch、没有 mount 状态 CRD、没有定期扫描目标容器 namespace。
-
-【设计规划】可选重协调方向：
-
-- wrapper 本地状态文件或 CRD 记录已挂载项。
-- 定期扫描 live Pod 与 mountinfo。
-- Pod 删除或容器重启后清理过期记录。
-- 对目标容器重启后的再挂载做重试或显式失败。
+【代码事实】wrapper 使用节点本地状态目录记录不含 token 的期望挂载，每个挂载独立写入一个 `0600` 文件，并为本节点 Pod 建立一个按 `spec.nodeName` 过滤的 `SharedIndexInformer`。当目标容器的 `containerID` 变化时，wrapper 重新校验 live Pod/PV/PVC 并挂入新 mount namespace；Pod 删除、终态、UID 不匹配或离开当前节点时删除过期记录。PID/cgroup 短暂不可见时，只对失败挂载做固定 worker 数量的有界退避重试，不按 Pod 周期扫描。
 
 ## 8. 与其他方案的区别
 
@@ -294,6 +281,8 @@ Kubernetes API
 - 通过 host `/proc` + cgroup 扫描获取目标容器 PID。
 - `setns` + `open_tree` + `move_mount` 动态挂载到目标容器 mount namespace。
 - staging path 挂载后清理和 wrapper 启动时 stale staging cleanup。
+- 节点本地期望挂载状态、目标容器重启后的 informer 事件重协调和有界重试。
+- 认证后的 `/v1/unmount`，并在卸载前删除期望状态以阻止复挂。
 - Chart、demo、Dockerfile、`scripts/build.sh`。
 - 单元测试覆盖 mounter request 解析、PV 授权基础规则、target path denylist、主容器选择。
 
@@ -305,15 +294,12 @@ Kubernetes API
 
 - 当前 `UnstageAfterMount` 相关能力与 Chart/entrypoint 的一致性。
 - 不同 Linux 内核、containerd/CRI-O、cgroup v1/v2 的兼容性验证。
-- 目标容器重启后动态挂载状态如何处理。
+- informer cache、目标容器重启恢复和失败重试的实际集群规模验证。
 
 ### 计划实现
 
 【设计规划】
 
-- `/v1/unmount` 或等价目标容器动态卸载接口。
-- per-target mount 状态记录与重复 mount 幂等返回。
-- wrapper 侧更强的本地节点校验，例如 Pod `spec.nodeName` 与当前节点一致。
 - 更细粒度的 PV/PVC 授权策略，避免仅以 namespace 作为授权粒度。
 - 可观测性：结构化日志、metrics、mount latency、失败原因分类。
 - 支持 dry-run 或 validate-only 请求，用于 controller 预检查。
@@ -385,13 +371,9 @@ Kubernetes API
 
 【代码事实 / 设计规划】
 
-- 当前没有目标容器路径 unmount API。
-- 当前没有持久化 mount 状态表，也没有 controller-level reconcile。
 - 当前 PV 授权粒度是 namespace + PV/PVC/driver identity，不是严格逐 Pod 声明的 volume 授权。
 - 当前目标容器 PID 查找依赖 host `/proc/*/cgroup` 字符串匹配，可能受 CRI、cgroup v2、节点发行版影响。
-- 当前未显式校验 Pod 是否调度在 wrapper 所在节点；如果请求打到错误节点，通常表现为找不到容器 PID。
 - 当前 target path denylist 是静态规则，后续可能需要按业务策略配置。
-- 当前重复 mount 到同一路径会报错，而不是“同源同目标返回成功”的幂等语义。
 - 当前没有完整 metrics、审计事件、结构化错误码。
 
 ### 备选方案
@@ -409,6 +391,6 @@ Kubernetes API
 
 【代码事实】当前仓库已经实现“低权限 mounter 通过 UDS 请求节点 wrapper，wrapper 校验 token/Pod/PV/PVC 后进入目标容器 mount namespace 动态挂载 NFS PV”的核心闭环。该闭环的关键代码集中在 `cmd/mounter`、`internal/wrapper` 和 `internal/node`。
 
-【设计规划】完整产品化还需要补齐动态卸载、状态重协调、逐 Pod 授权、runtime/CRI 兼容性和审计可观测能力。
+【设计规划】完整产品化还需要补齐逐 Pod 授权、runtime/CRI 兼容性、规模化重协调验证和审计可观测能力。
 
-【推测/待确认】如果进入专利撰写，建议把潜在发明点集中在“节点 wrapper 保留 upstream CSI 能力并额外提供动态 namespace mount API”“低权限 runtime mounter 与 TokenReview/live-resource 校验组合”“staging clone + move_mount 的提交路径”“Pod 运行后面向目标容器任意路径的受控挂载”这几类技术组合上，同时避免把尚未实现的 unmount/reconcile/grant 机制写成既成事实。
+【推测/待确认】如果进入专利撰写，建议把潜在发明点集中在“节点 wrapper 保留 upstream CSI 能力并额外提供动态 namespace mount API”“低权限 runtime mounter 与 TokenReview/live-resource 校验组合”“staging clone + move_mount 的提交路径”“Pod 运行后面向目标容器任意路径的受控挂载”这几类技术组合上，同时避免把尚未实现的 grant 机制写成既成事实。

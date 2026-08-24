@@ -2,8 +2,10 @@
 
 本文梳理动态 NFS mount 能直接给用户或运行时集成方调用的接口。
 
-推荐的用户调用面是 `kruise-nfs-mounter` 命令。wrapper 的 HTTP API 是更底层的
-Unix Domain Socket API，只应该挂载给 mounter sidecar，不应该直接暴露给业务容器。
+推荐的用户调用面是 `kruise-nfs-mounter` 命令，或
+`github.com/silver-chard/kruise-agents-nfs-csi/mounter` Go SDK。两者都是
+wrapper Unix Domain Socket API 的低权限客户端。底层 socket 只应该挂载给可信
+runtime 或 mounter sidecar，不应该直接暴露给不可信业务容器。
 
 ## API 总览
 
@@ -11,21 +13,27 @@ Unix Domain Socket API，只应该挂载给 mounter sidecar，不应该直接暴
 | --- | --- | --- | --- |
 | 运行时命令 | Sandbox runtime | `kruise-nfs-mounter mount --driver <driver> --config <base64 NodePublishVolumeRequest>` | 推荐集成方式。mounter 解析 CSI 输入后调用 wrapper，可选 PV 内目录 subPath。 |
 | 直接命令 | 可信 sidecar 或排障会话 | `kruise-nfs-mounter --pv <pv> --sub-path <dir> --target <path>` | 调用方已经知道 PV、可选 subPath 和目标路径时使用，适合调试或封装更上层接口。 |
+| Go SDK | 可信 runtime 或 sidecar 中的 Go 代码 | `mounter.NewClient(...).Mount(...)` | 不启动子进程，直接复用与 mounter 命令相同的低权限 UDS 协议、鉴权和重协调语义。 |
 | 健康检查 | 节点本地检查器 | `GET /healthz` over wrapper UDS | 确认 wrapper 进程正在服务，并返回当前 driver name。 |
 | Mount API | mounter sidecar | `POST /v1/mount` over wrapper UDS | 底层 JSON API，需要 projected service account bearer token。 |
+| Unmount API | mounter sidecar | `POST /v1/unmount` over wrapper UDS | 删除期望挂载并卸载当前目标，使用与 mount 相同的鉴权模型。 |
 
 所有请求和响应 JSON 字段都使用 `snake_case`。
 
 ## 调用链路
 
-1. Sandbox runtime 调用 `kruise-nfs-mounter`。
-2. mounter 从参数、环境变量或 Downward API projected 文件读取 Pod 身份。
-3. mounter 从 `PROJECTED_TOKEN_FILE` 读取 projected service account token。
-4. mounter 通过节点 wrapper Unix socket 发送 `POST /v1/mount`。
+1. 可信 runtime 选择调用 `kruise-nfs-mounter`，或在 Go 进程中调用 `mounter.Client`。
+2. 调用方从参数、环境变量或 Downward API projected 文件取得 Pod 身份；SDK
+   调用方把 namespace、Pod name 和 Pod UID 填入请求。
+3. 命令或 SDK 从配置的 token 文件读取 projected service account token。
+4. 命令或 SDK 通过节点 wrapper Unix socket 发送 `POST /v1/mount`。
 5. wrapper 校验 token、实时 Pod、PV、PVC、目标容器、driver name 和目标路径。
 6. wrapper 在节点上临时 stage NFS PV，并把整个 PV 或 PV 内指定目录 bind-mount 到目标容器的 mount namespace。
+7. wrapper 在节点持久化不含 token 的期望挂载；同一 Pod UID 的目标容器 ID 变化后，重新校验实时 Pod/PV/PVC 并挂入新的 mount namespace。
 
 业务容器不应该拿到 wrapper socket、projected wrapper token，或可任意选择 PV 的配置。
+
+每个节点 wrapper 只维护一个按本节点过滤的 Pod `SharedIndexInformer`，由 client-go 处理 LIST/WATCH、本地 cache、resourceVersion 和断线重连，不会按 Pod 周期轮询。容器重启恢复仍是最终一致的：从容器创建到对应 Pod status 事件处理完成之间，目标路径会有一个短暂未挂载窗口。需要在进程第一条指令前保证挂载的业务，仍应由 runtime 增加启动门禁或重试。
 
 ## 运行时命令
 
@@ -112,6 +120,56 @@ kruise-nfs-mounter \
 
 只建议在可信 sidecar 或受控排障会话中使用。调用环境仍然需要 wrapper socket 和
 projected token。
+
+## Go SDK
+
+Go 程序可以直接引用：
+
+```go
+import "github.com/silver-chard/kruise-agents-nfs-csi/mounter"
+```
+
+SDK 公开的主要接口是：
+
+```go
+func NewClient(Config) (*Client, error)
+func (*Client) Mount(context.Context, MountRequest) (*MountResult, error)
+func (*Client) Unmount(context.Context, UnmountRequest) (*UnmountResult, error)
+func (*Client) Health(context.Context) (*HealthResult, error)
+func (*Client) CloseIdleConnections()
+```
+
+`Config` 字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `DriverName` | `string` | 请求使用的 CSI driver name，必须与 wrapper 和 PV 一致。 |
+| `SocketPath` | `string` | 当前容器内可见的 wrapper Unix socket。 |
+| `TokenFile` | `string` | projected service account token 文件。SDK 在每次 mount/unmount 时重新读取，以兼容 token 轮换。 |
+| `HTTPTimeout` | `time.Duration` | UDS HTTP 请求超时；为 `0` 时使用 15 秒默认值。 |
+| `DisableHTTPTimeout` | `bool` | 显式关闭 client 级请求超时；通常不应启用，并应为每次调用传入有界 context。 |
+
+`MountRequest` 包含 `Namespace`、`PodName`、`PodUID`、`PVName`、
+`SourceSubPath`、`TargetPath` 和 `ContainerName`。`UnmountRequest`
+包含相同的身份和目标字段，但不包含 `SourceSubPath`。
+
+SDK 只是现有 mounter 的进程内客户端封装：
+
+- 不直接执行 mount；
+- 不访问 CSI socket 或 host `/proc`；
+- 不需要 privileged 或 `SYS_ADMIN`；
+- 仍然需要 wrapper socket、projected token 和 Downward API Pod identity；
+- 所有 mount/unmount 仍由 wrapper 执行 TokenReview，并重新检查实时
+  Pod、PV、PVC、目标容器、driver 和目标路径；
+- 成功挂载仍由节点 wrapper 持久化期望状态并负责容器重启后的重协调。
+
+不要为了使用 SDK 把 wrapper socket 和 projected token 交给不可信业务代码。
+SDK 应运行在可信 runtime 或专用 sidecar 中。完整配置、可编译风格示例和错误处理
+见 [Go SDK 使用说明](sdk.md)。
+
+SDK 会自动使用当前模块的 wrapper API 版本，wrapper 会严格校验该版本。SDK 依赖
+与节点 wrapper 镜像应固定到同一个发布版本或 commit，并一起升级；健康检查不提供
+协议版本协商。
 
 ## Wrapper Socket API
 
@@ -272,11 +330,12 @@ wrapper 会拒绝：
 - 包含 NUL byte 的路径；
 - 相对路径。
 
-## Sidecar 集成清单
+## Sidecar 与 SDK 集成清单
 
-mounter sidecar 需要：
+mounter sidecar 或 SDK 调用方需要：
 
-- `kruise-nfs-mounter` 二进制；
+- 命令模式需要 `kruise-nfs-mounter` 二进制；SDK 模式需要 Go 包
+  `github.com/silver-chard/kruise-agents-nfs-csi/mounter`；
 - `DRIVER_NAME`，并且与已安装 driver 和 PV 匹配；
 - 从节点 wrapper state 目录挂载的 `WRAPPER_SOCKET_PATH`；
 - audience 匹配 `TOKEN_AUDIENCE` 的 `PROJECTED_TOKEN_FILE`；
@@ -288,6 +347,7 @@ wrapper DaemonSet 需要：
 - 相同的 `DRIVER_NAME`；
 - 相同的 `TOKEN_AUDIENCE`；
 - host 上的 wrapper state 目录和 kubelet pod 目录；
+- `WRAPPER_MOUNT_STATE_DIR` 必须持久化到节点，并且只允许 wrapper 写入；
 - Linux 节点 mount 能力；
 - 用于 TokenReview、Pod、PV、PVC 读取的 Kubernetes RBAC。
 
@@ -306,9 +366,11 @@ wrapper 环境变量：
 | --- | --- | --- |
 | `DRIVER_NAME` | `csi.nfs.zhida` | 请求和 PV 期望的 CSI driver name。 |
 | `WRAPPER_SOCKET_PATH` | `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | UDS 路径。 |
-| `WRAPPER_SOCKET_MODE` | `0660` | UDS 文件权限。 |
+| `WRAPPER_SOCKET_MODE` | `0660` | UDS 文件权限；chart 默认让 socket group 可写，mounter 容器需要使用相同 group。 |
 | `TOKEN_AUDIENCE` | `kruise-agents-nfs-csi.zhida/sandbox-mounter` | TokenReview audience。 |
 | `WRAPPER_STAGING_ROOT` | `/var/lib/kruise-agents-nfs-csi/staging` | 节点上按 PV staging 的根目录。 |
+| `WRAPPER_MOUNT_STATE_DIR` | `/var/lib/kruise-agents-nfs-csi/mounts` | 节点持久化期望挂载状态；每个挂载独立写一个 `0600` 文件，不保存 token。 |
+| `WRAPPER_NODE_NAME` | `NODE_ID`、`KUBE_NODE_NAME` 或空 | wrapper 所在 Kubernetes 节点名，用于建立仅过滤本节点 Pod 的 informer；chart 通过 Downward API 注入。为空时禁用重协调。 |
 | `WRAPPER_ENABLE_MOUNT` | `true` | 设置为 `false` 时只验证 API 链路，不做真实 mount。 |
 | `WRAPPER_UNSTAGE_AFTER_MOUNT` | `true` | 每次成功 bind mount 后，卸载并删除该 PV 的 staging source。 |
 | `WRAPPER_REQUEST_TIMEOUT` | `30s` | Kubernetes 与 mount 操作的单请求超时。 |
@@ -325,3 +387,7 @@ mounter 环境变量：
 | `POD_UID` | 空 | Pod UID。 |
 | `CONTAINER_NAME` | 空 | 可选目标业务容器。 |
 | `MOUNTER_HTTP_TIMEOUT` | `15s` | wrapper HTTP client 超时。 |
+
+Go SDK 不隐式读取上述 mounter 环境配置。调用方通过 `mounter.Config` 设置
+`DriverName`、`SocketPath`、`TokenFile` 和 `HTTPTimeout`，并把从
+Downward API 获得的 Pod namespace、name 和 UID 填入每个 mount/unmount 请求。

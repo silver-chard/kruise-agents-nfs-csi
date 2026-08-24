@@ -58,8 +58,14 @@ type Pod struct {
 	Status   PodStatus  `json:"status"`
 }
 
+type PodWatchEvent struct {
+	Type string
+	Pod  Pod
+}
+
 type PodSpec struct {
 	ServiceAccountName string      `json:"serviceAccountName"`
+	NodeName           string      `json:"nodeName"`
 	Volumes            []Volume    `json:"volumes"`
 	Containers         []Container `json:"containers"`
 }

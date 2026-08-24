@@ -25,3 +25,7 @@ func (unsupportedMounter) Mount(context.Context, MountPlan) error {
 func (unsupportedMounter) Unmount(context.Context, MountPlan) error {
 	return fmt.Errorf("node unmount is only supported on linux")
 }
+
+func (unsupportedMounter) IsMounted(context.Context, MountPlan) (bool, error) {
+	return false, fmt.Errorf("node mount inspection is only supported on linux")
+}

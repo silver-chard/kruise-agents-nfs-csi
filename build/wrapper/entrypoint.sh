@@ -5,6 +5,7 @@ set -eu
 : "${CSI_ENDPOINT:=unix:///csi/csi.sock}"
 : "${WRAPPER_SOCKET_PATH:=/var/lib/kruise-agents-nfs-csi/wrapper.sock}"
 : "${WRAPPER_STAGING_ROOT:=/var/lib/kruise-agents-nfs-csi/staging}"
+: "${WRAPPER_MOUNT_STATE_DIR:=/var/lib/kruise-agents-nfs-csi/mounts}"
 : "${WRAPPER_UNSTAGE_AFTER_MOUNT:=true}"
 : "${WRAPPER_AGENT_ENABLED:=true}"
 

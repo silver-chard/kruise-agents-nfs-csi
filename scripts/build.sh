@@ -18,7 +18,7 @@ MOUNTER_IMAGE="${MOUNTER_IMAGE:-${REGISTRY}/kruise-agents-nfs-csi-mounter:${VERS
 
 mkdir -p "${BIN_DIR}"
 
-gofmt -w ./cmd ./internal
+gofmt -w ./cmd ./internal ./mounter
 GOCACHE="${GO_CACHE}" GOMODCACHE="${GO_MOD_CACHE}" go test ./...
 GOCACHE="${GO_CACHE}" GOMODCACHE="${GO_MOD_CACHE}" go vet ./...
 

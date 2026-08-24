@@ -25,6 +25,15 @@ growing with the total number of PVs that have ever been dynamically mounted on
 the node. Set it to `false` only when intentionally trading node mount-table
 growth for repeated-mount reuse of the same staged PV.
 
+Successful dynamic mounts are also recorded as one root-only node state file per mount.
+Each wrapper uses one node-filtered Kubernetes `SharedIndexInformer`, and when
+the same Pod UID gets a new target container ID, re-validates the Pod/PV/PVC
+relationship and mounts the volume into the replacement container namespace.
+The informer owns LIST/WATCH cache synchronization and reconnection; the wrapper
+does not poll every Pod.
+Explicit unmount removes the desired state so reconciliation cannot recreate
+it. The state files never contain the projected bearer token or NFS credentials.
+
 ## Components
 
 - `cmd/wrapper`: node DaemonSet agent that listens on a Unix socket, performs
@@ -32,6 +41,9 @@ growth for repeated-mount reuse of the same staged PV.
   delegates mount work to the node-side mount implementation.
 - `cmd/mounter`: low-privilege sidecar client invoked by sandbox runtime. It
   reads a projected service account token and calls the wrapper socket API.
+- `mounter`: public Go SDK for trusted runtime and sidecar integrations. It
+  uses the same low-privilege wrapper UDS API as `cmd/mounter`; importing it
+  does not embed the node mounter or wrapper.
 - `internal/api`: stable JSON request and response types.
 - `internal/kube`: minimal in-cluster Kubernetes REST client using only the Go
   standard library.
@@ -51,6 +63,8 @@ The dangerous operations are concentrated in the node DaemonSet wrapper:
 - the wrapper validates projected service account tokens with TokenReview;
 - the wrapper re-checks Pod and PV state from the apiserver;
 - the wrapper re-checks the live PVC bound by the PV claimRef;
+- after a target container restart, the wrapper re-checks the live Pod, PV, and
+  PVC before restoring the mount in the new container namespace;
 - the wrapper only allows the configured CSI driver;
 - the wrapper rejects dangerous target paths such as `/`, `/proc`, `/sys`,
   `/dev`, and Kubernetes secret paths;
@@ -71,7 +85,7 @@ provisioning.
 ## Local Validation
 
 ```sh
-gofmt -w ./cmd ./internal
+gofmt -w ./cmd ./internal ./mounter
 go test ./...
 go vet ./...
 go build ./cmd/wrapper ./cmd/mounter
@@ -102,8 +116,21 @@ PUSH=1 scripts/build.sh
 
 ## API
 
-For the user-facing command and wrapper API contract, see
-[docs/api.md](docs/api.md). For non-Kruise workloads that call the mounter
+There are three supported integration styles:
+
+1. invoke the `kruise-nfs-mounter` binary directly;
+2. let an OpenKruise runtime invoke the same binary with a CSI
+   `NodePublishVolumeRequest`;
+3. import `github.com/silver-chard/kruise-agents-nfs-csi/mounter` as a Go SDK.
+
+All three are low-privilege clients of the same wrapper Unix socket. The Go SDK
+does not mount filesystems directly, does not need `SYS_ADMIN`, and should run
+only in a trusted runtime or sidecar that receives the wrapper socket,
+projected token, and Downward API Pod identity.
+
+For the user-facing command, SDK, and wrapper API contract, see
+[docs/api.md](docs/api.md). The complete Go SDK guide is
+[docs/sdk.md](docs/sdk.md). For non-Kruise workloads that call the mounter
 directly, see [docs/standalone-mounter.md](docs/standalone-mounter.md).
 
 The wrapper listens on a Unix socket, by default:

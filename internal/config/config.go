@@ -19,6 +19,7 @@ const (
 	DefaultKubeTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	DefaultKubeCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	DefaultStagingRoot   = "/var/lib/kruise-agents-nfs-csi/staging"
+	DefaultMountStateDir = "/var/lib/kruise-agents-nfs-csi/mounts"
 	DefaultHostProcRoot  = "/proc"
 )
 
@@ -30,6 +31,8 @@ type WrapperConfig struct {
 	KubeTokenFile     string
 	KubeCAFile        string
 	StagingRoot       string
+	MountStateDir     string
+	NodeName          string
 	HostProcRoot      string
 	RequestTimeout    time.Duration
 	EnableMount       bool
@@ -56,6 +59,8 @@ func LoadWrapperConfig() WrapperConfig {
 		KubeTokenFile:  Env("KUBE_TOKEN_FILE", DefaultKubeTokenFile),
 		KubeCAFile:     Env("KUBE_CA_FILE", DefaultKubeCAFile),
 		StagingRoot:    Env("WRAPPER_STAGING_ROOT", DefaultStagingRoot),
+		MountStateDir:  Env("WRAPPER_MOUNT_STATE_DIR", DefaultMountStateDir),
+		NodeName:       Env("WRAPPER_NODE_NAME", Env("NODE_ID", Env("KUBE_NODE_NAME", ""))),
 		HostProcRoot:   Env("WRAPPER_HOST_PROC_ROOT", DefaultHostProcRoot),
 		RequestTimeout: DurationEnv("WRAPPER_REQUEST_TIMEOUT", 30*time.Second),
 		EnableMount:    BoolEnv("WRAPPER_ENABLE_MOUNT", true),

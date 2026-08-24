@@ -1,19 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/config"
+	"github.com/silver-chard/kruise-agents-nfs-csi/mounter"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/spf13/cobra"
@@ -34,16 +32,23 @@ func main() {
 		exitError(err)
 	}
 
-	tokenBytes, err := os.ReadFile(cfg.TokenFile)
+	httpTimeout := cfg.HTTPTimeout
+	if httpTimeout < 0 {
+		httpTimeout = 0
+	}
+	client, err := mounter.NewClient(mounter.Config{
+		DriverName:         request.Mount.DriverName,
+		SocketPath:         cfg.SocketPath,
+		TokenFile:          cfg.TokenFile,
+		HTTPTimeout:        httpTimeout,
+		DisableHTTPTimeout: cfg.HTTPTimeout <= 0,
+	})
 	if err != nil {
-		exitError(fmt.Errorf("read projected token file: %w", err))
+		exitError(err)
 	}
-	token := strings.TrimSpace(string(tokenBytes))
-	if token == "" {
-		exitError(fmt.Errorf("projected token file is empty"))
-	}
+	defer client.CloseIdleConnections()
 
-	result, err := callWrapper(context.Background(), cfg, token, request)
+	result, err := callMounter(context.Background(), client, request)
 	if err != nil {
 		exitError(err)
 	}
@@ -296,88 +301,30 @@ func validateCLIRequest(request api.MountRequest) error {
 	return nil
 }
 
-func callWrapper(ctx context.Context, cfg config.MounterConfig, token string, request cliRequest) (any, error) {
-	var endpoint string
-	var payloadRequest any
+func callMounter(ctx context.Context, client *mounter.Client, request cliRequest) (any, error) {
 	switch request.Operation {
 	case operationMount:
-		endpoint = "/v1/mount"
-		payloadRequest = request.Mount
+		return client.Mount(ctx, mounter.MountRequest{
+			Namespace:     request.Mount.Namespace,
+			PodName:       request.Mount.PodName,
+			PodUID:        request.Mount.PodUID,
+			PVName:        request.Mount.PVName,
+			SourceSubPath: request.Mount.SourceSubPath,
+			TargetPath:    request.Mount.TargetPath,
+			ContainerName: request.Mount.ContainerName,
+		})
 	case operationUnmount:
-		endpoint = "/v1/unmount"
-		payloadRequest = api.UnmountRequest{
-			APIVersion:    request.Mount.APIVersion,
-			DriverName:    request.Mount.DriverName,
+		return client.Unmount(ctx, mounter.UnmountRequest{
 			Namespace:     request.Mount.Namespace,
 			PodName:       request.Mount.PodName,
 			PodUID:        request.Mount.PodUID,
 			PVName:        request.Mount.PVName,
 			TargetPath:    request.Mount.TargetPath,
 			ContainerName: request.Mount.ContainerName,
-		}
+		})
 	default:
 		return nil, fmt.Errorf("unsupported operation %q", request.Operation)
 	}
-
-	payload, err := json.Marshal(payloadRequest)
-	if err != nil {
-		return nil, fmt.Errorf("marshal %s request: %w", request.Operation, err)
-	}
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		dialer := net.Dialer{}
-		return dialer.DialContext(ctx, "unix", cfg.SocketPath)
-	}
-	client := http.Client{Transport: transport, Timeout: cfg.HTTPTimeout}
-
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix"+endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("create wrapper request: %w", err)
-	}
-	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest.Header.Set("Accept", "application/json")
-	httpRequest.Header.Set("Authorization", "Bearer "+token)
-
-	response, err := client.Do(httpRequest)
-	if err != nil {
-		return nil, fmt.Errorf("call wrapper socket %s: %w", cfg.SocketPath, err)
-	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read wrapper response: %w", err)
-	}
-
-	var apiResponse struct {
-		Data  json.RawMessage `json:"data,omitempty"`
-		Error string          `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal(body, &apiResponse); err != nil {
-		return nil, fmt.Errorf("decode wrapper response: %w", err)
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if apiResponse.Error != "" {
-			return nil, fmt.Errorf("wrapper rejected %s request: %s", request.Operation, apiResponse.Error)
-		}
-		return nil, fmt.Errorf("wrapper rejected %s request with status %s", request.Operation, response.Status)
-	}
-	if len(apiResponse.Data) == 0 {
-		return nil, fmt.Errorf("wrapper response did not include data")
-	}
-	if request.Operation == operationUnmount {
-		var result api.UnmountResult
-		if err := json.Unmarshal(apiResponse.Data, &result); err != nil {
-			return nil, fmt.Errorf("decode wrapper unmount result: %w", err)
-		}
-		return &result, nil
-	}
-	var result api.MountResult
-	if err := json.Unmarshal(apiResponse.Data, &result); err != nil {
-		return nil, fmt.Errorf("decode wrapper mount result: %w", err)
-	}
-	return &result, nil
 }
 
 func readFirstExistingFile(paths ...string) string {

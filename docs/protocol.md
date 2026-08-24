@@ -107,5 +107,7 @@ Success:
 }
 ```
 
-The wrapper rejects unmount when the requested target path is not currently a
-mount point in the target container mount namespace.
+Unmount removes the saved desired mount before touching the target namespace.
+If the target is already absent (for example, while a replacement container is
+starting), the operation still succeeds and prevents reconciliation from
+recreating the mount.

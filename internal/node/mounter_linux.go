@@ -96,6 +96,24 @@ func (m *linuxMounter) Unmount(ctx context.Context, plan MountPlan) error {
 	return unmountInContainerNamespace(m.cfg.HostProcRoot, pid, plan.TargetPath)
 }
 
+func (m *linuxMounter) IsMounted(ctx context.Context, plan MountPlan) (bool, error) {
+	if !m.cfg.EnableMount {
+		return false, ErrMountDisabled
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if plan.ContainerID == "" {
+		return false, fmt.Errorf("container %s has empty container id", plan.ContainerName)
+	}
+
+	pid, err := findContainerPID(m.cfg.HostProcRoot, plan.PodUID, plan.ContainerID)
+	if err != nil {
+		return false, err
+	}
+	return isMountPoint(filepath.Join(m.cfg.HostProcRoot, strconv.Itoa(pid), "mountinfo"), plan.TargetPath)
+}
+
 func (m *linuxMounter) bindMountWithModernAPI(targetPID int, stagePath, sourceSubPath, targetPath string) error {
 	sourceFD, sourceDescription, err := openTreeMountSource(stagePath, sourceSubPath)
 	if err != nil {

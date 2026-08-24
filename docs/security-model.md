@@ -60,6 +60,29 @@ For the dynamic path, the sandbox runtime invokes the mounter with a CSI
 `NodePublishVolumeRequest`. The workload container does not receive the wrapper
 socket or projected wrapper token.
 
+## Container Restart Reconciliation
+
+After the initial authenticated mount succeeds, the wrapper stores only the
+normalized Pod/PV/container/target mount intent and the mounted container ID in
+its node-local state directory. Each desired mount has its own `0600` file, so
+updates do not rewrite every Pod's state. It does not persist the projected bearer token, NFS
+credentials, or a caller-supplied NFS server.
+
+The wrapper runs one `SharedIndexInformer` filtered by its own node name. The
+informer owns LIST/WATCH cache synchronization, resource-version handling, and
+reconnection; the wrapper does not issue periodic GET requests for every saved
+Pod. When an informer event reports a different container ID for the same Pod
+UID and container name, the wrapper validates the live Pod, PV, PV claimRef, and
+PVC again before mounting into the replacement container namespace. A deleted,
+terminal, UID-mismatched, or different-node Pod makes the saved intent stale and
+removes it. Explicit authenticated unmount removes the intent before unmounting
+so the reconciler cannot recreate it.
+
+Reconciliation is event-driven but still eventually consistent. The target path
+is absent between container creation and handling its Pod status event, so
+applications that require the mount before their first instruction still need a
+runtime startup gate or retry behavior.
+
 ## Driver Name
 
 The default driver name is:

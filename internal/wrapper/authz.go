@@ -57,18 +57,32 @@ func authorizeToken(status *kube.TokenReviewStatus, namespace, expectedAudience 
 }
 
 func authorizePod(tokenStatus *kube.TokenReviewStatus, pod *kube.Pod, request api.MountRequest) error {
+	if err := validatePodIdentity(pod, request); err != nil {
+		return err
+	}
+	expectedUser := "system:serviceaccount:" + request.Namespace + ":" + pod.Spec.ServiceAccountName
+	if tokenStatus.User.Username != expectedUser {
+		return fmt.Errorf("token service account %s does not match pod service account %s", tokenStatus.User.Username, expectedUser)
+	}
+	return nil
+}
+
+func validatePodIdentity(pod *kube.Pod, request api.MountRequest) error {
 	if pod.Metadata.Namespace != request.Namespace || pod.Metadata.Name != request.PodName {
 		return fmt.Errorf("pod identity mismatch for %s/%s", request.Namespace, request.PodName)
 	}
 	if pod.Metadata.UID != request.PodUID {
 		return fmt.Errorf("pod uid mismatch for %s/%s", request.Namespace, request.PodName)
 	}
-	expectedUser := "system:serviceaccount:" + request.Namespace + ":" + pod.Spec.ServiceAccountName
-	if tokenStatus.User.Username != expectedUser {
-		return fmt.Errorf("token service account %s does not match pod service account %s", tokenStatus.User.Username, expectedUser)
-	}
 	if pod.Status.Phase == "Succeeded" || pod.Status.Phase == "Failed" {
 		return fmt.Errorf("pod %s/%s is not running: phase=%s", request.Namespace, request.PodName, pod.Status.Phase)
+	}
+	return nil
+}
+
+func validatePodNode(pod *kube.Pod, nodeName string) error {
+	if nodeName != "" && pod.Spec.NodeName != nodeName {
+		return fmt.Errorf("pod %s/%s is scheduled on node %s, wrapper serves node %s", pod.Metadata.Namespace, pod.Metadata.Name, pod.Spec.NodeName, nodeName)
 	}
 	return nil
 }

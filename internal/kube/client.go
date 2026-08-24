@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,12 +15,33 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 )
 
 type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+	podREST rest.Interface
+}
+
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Status     string
+	Detail     string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("kubernetes api %s %s returned %s: %s", e.Method, e.Path, e.Status, e.Detail)
+}
+
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 func NewInClusterClient(tokenFile, caFile string, timeout time.Duration) (*Client, error) {
@@ -45,10 +67,22 @@ func NewInClusterClient(tokenFile, caFile string, timeout time.Duration) (*Clien
 		}
 	}
 
+	restConfig := &rest.Config{
+		Host:            "https://" + netJoinHostPort(host, port),
+		BearerTokenFile: tokenFile,
+		TLSClientConfig: rest.TLSClientConfig{CAFile: caFile},
+		UserAgent:       "kruise-agents-nfs-csi-wrapper",
+	}
+	coreClient, err := corev1client.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create kubernetes core client: %w", err)
+	}
+
 	return &Client{
 		baseURL: "https://" + netJoinHostPort(host, port),
 		token:   strings.TrimSpace(string(tokenBytes)),
 		http:    &http.Client{Transport: transport, Timeout: timeout},
+		podREST: coreClient.RESTClient(),
 	}, nil
 }
 
@@ -124,7 +158,13 @@ func (c *Client) do(ctx context.Context, method, resourcePath string, in, out an
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("kubernetes api %s %s returned %s: %s", method, resourcePath, resp.Status, strings.TrimSpace(string(limited)))
+		return &APIError{
+			Method:     method,
+			Path:       resourcePath,
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Detail:     strings.TrimSpace(string(limited)),
+		}
 	}
 
 	if out == nil {

@@ -161,6 +161,8 @@ mounter 需要满足这些条件：
 - CSI driver name 是 `csi.nfs.cnap.com`；
 - mounter 镜像是 `iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-mounter:0.0.3`；
 - wrapper socket 在节点上的目录是 `/var/lib/kruise-agents-nfs-csi`；
+- wrapper chart 使用默认 `wrapper.socketGroup=2000`，mounter 容器用同一个 `runAsGroup`
+  访问 `0660` 的 socket；
 - projected token audience 是 `kruise-agents-nfs-csi.zhida/sandbox-mounter`；
 - 已经存在可让 PVC Bound 的 StorageClass `nfs-csi`。如果安装时设置了
   `storageClass.create=false`，需要客户提前创建同 driver 的 StorageClass/PV，或把 PVC
@@ -248,6 +250,8 @@ spec:
         - name: CONTAINER_NAME
           value: main
       securityContext:
+        runAsUser: 1000
+        runAsGroup: 2000
         privileged: false
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -418,3 +422,14 @@ wrapper 会返回错误，不会主动覆盖已有 mount point。调用方需要
 不会。wrapper 会先把 `stagePath/subPath` clone/move 到业务容器的 mount namespace，
 再清理节点上的 staging mount。业务容器里的 mount 已经是独立 mount 引用，不依赖
 staging 路径继续存在。
+
+### 业务容器重启后动态挂载会丢吗？
+
+挂载属于具体容器的 mount namespace，容器重启会创建新的 namespace，旧挂载不会自动继承。
+wrapper 会把每个成功挂载分别记录到节点状态目录，并在检测到同一 Pod UID 的目标容器 ID 变化后，
+重新校验实时 Pod/PV/PVC，再把卷挂入新 namespace。每个 wrapper 只维护一条按本节点过滤
+的 Pod `SharedIndexInformer`，不会周期轮询每个 Pod。恢复仍是最终一致的；如果业务启动
+第一条指令就依赖该目录，runtime 仍应增加启动门禁或重试。
+
+把 `WRAPPER_UNSTAGE_AFTER_MOUNT` 改为 `false` 不能单独解决容器重启问题：它只保留节点 staging
+source，不会触发向新 mount namespace 的重新挂载。
