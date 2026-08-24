@@ -45,11 +45,11 @@ Squash mode:  NO_ROOT_SQUASH
 如果页面中已有多条重叠规则，要确认最精确命中的规则也是 `READ_WRITE`。例如下面这种配置会导致节点仍然只读：
 
 ```text
-10.0.0.0/16     READ_WRITE
-10.0.1.0/24     READ_ONLY
+192.0.2.0/24     READ_WRITE
+192.0.2.128/25   READ_ONLY
 ```
 
-当节点 IP 在 `10.0.1.0/24` 内时，更精确的 `READ_ONLY` 会优先生效。
+当节点 IP 在示例网段 `192.0.2.128/25` 内时，更精确的 `READ_ONLY` 会优先生效。
 
 ## StorageClass 配置
 

@@ -11,14 +11,28 @@ runtime 或 mounter sidecar，不应该直接暴露给不可信业务容器。
 
 | 层次 | 调用方 | 接口 | 用途 |
 | --- | --- | --- | --- |
-| 运行时命令 | Sandbox runtime | `kruise-nfs-mounter mount --driver <driver> --config <base64 NodePublishVolumeRequest>` | 推荐集成方式。mounter 解析 CSI 输入后调用 wrapper，可选 PV 内目录 subPath。 |
-| 直接命令 | 可信 sidecar 或排障会话 | `kruise-nfs-mounter --pv <pv> --sub-path <dir> --target <path>` | 调用方已经知道 PV、可选 subPath 和目标路径时使用，适合调试或封装更上层接口。 |
+| 运行时命令 | OpenKruise runtime | `kruise-nfs-mounter mount --driver <driver> --config <base64 NodePublishVolumeRequest>` | 推荐集成方式。mounter 解析 CSI 输入后调用 wrapper，可选 PV 内目录 subPath。 |
+| 直接命令 | 可信 sidecar 或排障会话 | `kruise-nfs-mounter mount --pv <pv> --sub-path <dir> --target <path>` | 调用方已经知道 PV、可选 subPath 和目标路径时使用，适合调试或封装更上层接口。 |
 | Go SDK | 可信 runtime 或 sidecar 中的 Go 代码 | `mounter.NewClient(...).Mount(...)` | 不启动子进程，直接复用与 mounter 命令相同的低权限 UDS 协议、鉴权和重协调语义。 |
 | 健康检查 | 节点本地检查器 | `GET /healthz` over wrapper UDS | 确认 wrapper 进程正在服务，并返回当前 driver name。 |
 | Mount API | mounter sidecar | `POST /v1/mount` over wrapper UDS | 底层 JSON API，需要 projected service account bearer token。 |
 | Unmount API | mounter sidecar | `POST /v1/unmount` over wrapper UDS | 删除期望挂载并卸载当前目标，使用与 mount 相同的鉴权模型。 |
 
 所有请求和响应 JSON 字段都使用 `snake_case`。
+
+## v0.0.2 wrapper 启动配置
+
+v0.0.2 新增缺失 SourceSubPath 的可选创建策略。这个策略属于 wrapper
+部署配置，不是单次 mount 请求字段：
+
+| 环境变量 | Wrapper flag | Helm value | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `WRAPPER_CREATE_MISSING_SUBPATHS` | `--create-missing-subpaths` | `wrapper.createMissingSubPaths` | `false` | 是否逐级创建缺失的 `source_sub_path`。默认关闭，保持原有“目录必须已存在”的行为。 |
+| `WRAPPER_CREATED_SUBPATH_MODE` | `--created-subpath-mode` | `wrapper.createdSubPathMode` | `0770` | 新建每一级目录传给 `mkdirat` 的八进制 mode。实际 mode 仍受进程 umask 和文件系统/NFS default ACL 影响。 |
+
+mode 必须是 `0001` 到 `07777` 范围内的八进制权限字符串；`0000` 或非法值会
+导致 wrapper 启动失败。wrapper 不会为新建或已有目录执行 `chown`，也不会修改
+已有目录的 mode。
 
 ## 调用链路
 
@@ -71,7 +85,7 @@ kruise-nfs-mounter mount \
 | --- | --- | --- | --- |
 | `--driver` | 否 | `DRIVER_NAME` 或 `csi.nfs.zhida` | wrapper 和 PV 期望的 CSI driver name。 |
 | `--config` | 是 | 无 | base64 CSI `NodePublishVolumeRequest`。 |
-| `--sub-path` | 否 | `NodePublishVolumeRequest` 中的 subPath 或空 | PV 内目录 subPath。不传时挂整个 PV；传入时只支持已存在目录。 |
+| `--sub-path` | 否 | `NodePublishVolumeRequest` 中的 subPath 或空 | PV 内目录 subPath。不传时挂整个 PV；默认只支持已存在目录，wrapper 显式开启创建策略后可以安全创建缺失目录。 |
 | `--container` | 视情况 | `CONTAINER_NAME` | 目标业务容器。Pod 多容器且没有 `SANDBOX_MAIN_CONTAINER=true` 标记时必须传。 |
 | `--namespace` | 否 | `POD_NAMESPACE`、`NAMESPACE_FILE` 或 service account namespace 文件 | 请求 Pod namespace。 |
 | `--pod-name` | 否 | `POD_NAME`、`POD_NAME_FILE` 或 `/etc/hostname` | 请求 Pod name。 |
@@ -107,7 +121,7 @@ kruise-nfs-mounter mount \
 直接命令跳过 CSI protobuf 解析，但仍然会走 wrapper 的鉴权和 mount 逻辑：
 
 ```sh
-kruise-nfs-mounter \
+kruise-nfs-mounter mount \
   --driver-name csi.nfs.zhida \
   --namespace openkruise-sandbox-demo \
   --pod-name sandbox-demo-0 \
@@ -230,7 +244,7 @@ Authorization: Bearer <projected-service-account-token>
 | `pod_name` | 是 | 请求 Pod name。 |
 | `pod_uid` | 是 | 请求 Pod UID，用于防止 Pod name 复用导致误授权。 |
 | `pv_name` | 是 | 要挂载的 PersistentVolume。wrapper 从实时 PV 对象读取 NFS source 信息。 |
-| `source_sub_path` | 否 | PV 内目录 subPath。为空时挂整个 PV；不为空时必须是相对目录路径，且不能包含 `..`、绝对路径或 symlink 组件。 |
+| `source_sub_path` | 否 | PV 内目录 subPath。为空时挂整个 PV；不为空时必须是相对目录路径，且不能包含 `..`、绝对路径或 symlink 组件。目录默认必须存在；是否创建缺失目录由 wrapper 全局策略决定。 |
 | `target_path` | 是 | 目标业务容器内的绝对路径。wrapper 会用 `path.Clean` 归一化并拒绝敏感路径。 |
 | `container_name` | 否 | 目标容器名。为空时优先选择带 `SANDBOX_MAIN_CONTAINER=true` 的容器；没有标记时只接受单容器 Pod。 |
 
@@ -264,10 +278,11 @@ Authorization: Bearer <projected-service-account-token>
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | mount 请求已完成。 |
-| `400` | JSON 非法、缺少必填字段、`api_version` 不匹配、`driver_name` 不匹配、source subPath/目标路径非法，或目标容器选择非法。 |
+| `400` | JSON 非法、缺少必填字段、`api_version` 不匹配、`driver_name` 不匹配、source subPath/目标路径非法、缺失 subPath 且创建策略关闭，或目标容器选择非法。 |
 | `401` | 缺少 bearer token、Authorization 格式错误，或 token 为空。 |
-| `403` | Token、Pod、PV、PVC、driver、namespace、claimRef 或节点 mount 校验失败。 |
+| `403` | Token、Pod、PV、PVC、driver、namespace 或 claimRef 鉴权/实时资源校验失败。 |
 | `405` | HTTP method 不支持。 |
+| `500` | 鉴权通过后节点 mount/unmount 操作失败，包括自动创建目录时的 `EACCES`、`EROFS`、`ENOSPC` 或 `EDQUOT` 等存储错误。 |
 | `503` | `WRAPPER_ENABLE_MOUNT=false`，节点 mount 操作被禁用。 |
 
 排障时可以用 `curl` 直接调用 UDS：
@@ -301,21 +316,35 @@ wrapper 只有在下面检查全部通过时才会执行 mount：
 | PVC 身份 | wrapper 会读取 PV claimRef 指向的实时 PVC，并校验 namespace、name 和存在时的 UID。 |
 | Container | 目标容器必须出现在 Pod status 中，并且 container ID 不能为空。 |
 | NFS source | PV CSI `volumeAttributes` 必须包含 `server` 和 `share`；`subDir` 可选。 |
-| Source subPath | `source_sub_path` 为空时挂整个 PV；不为空时只能指向 PV 内已存在的目录。 |
+| Source subPath | `source_sub_path` 为空时挂整个 PV；不为空时必须是安全的相对目录。默认必须已存在，只有 wrapper 显式开启创建策略后才会创建缺失目录。 |
 | Target path | 目标路径必须是绝对路径，且不能指向敏感系统路径或 secret 路径。 |
 | Existing mount | 如果目标路径已经是 mount point，wrapper 返回错误，不会主动 unmount。 |
 
 ## Source SubPath 规则
 
-`source_sub_path` 是 PV 内部的目录路径，不是业务容器内路径。wrapper 会拒绝：
+`source_sub_path` 是 PV 内部的目录路径，不是业务容器内路径。无论是否启用
+自动创建，wrapper 都会拒绝：
 
 - 绝对路径；
 - 包含 NUL byte 的路径；
 - 任何路径段为 `..` 的路径；
-- 不存在的目录；
-- 任意路径组件是 symlink 的目录。
+- 任意已有路径组件是 symlink；
+- 任意已有路径组件不是目录。
 
-空值表示挂载整个 PV。当前只支持目录 subPath，不支持文件 subPath。
+空值表示挂载整个 PV。当前只支持目录 subPath，不支持文件 subPath。默认配置
+`WRAPPER_CREATE_MISSING_SUBPATHS=false` 下，任意组件不存在也会被拒绝。
+
+启用 `WRAPPER_CREATE_MISSING_SUBPATHS=true` 后，wrapper 使用逐级、禁止跟随 symlink
+的方式创建缺失组件。每一级请求使用 `WRAPPER_CREATED_SUBPATH_MODE`（默认
+`0770`）传给 `mkdirat`，但实际 mode 会受到 wrapper 进程 umask 和文件系统/NFS
+default ACL 约束。已经存在的目录不会被 `chmod` 或 `chown`；新目录也不会被
+`chmod` 或 `chown`。如果中间创建失败，之前成功创建的父目录不会回滚。
+
+NFS export 权限仍然是最终约束。启用 `root_squash` 时，wrapper 的 root 身份通常
+会映射成匿名 UID/GID，因此创建可能失败，或者新目录 owner 与业务容器不匹配。
+mode `0770` 在 group 不一致时仍会阻止业务访问。对 owner/group 有明确要求时，应
+预先按目标 UID/GID 创建目录，或先对 export policy、匿名身份、umask、default ACL、
+group 和 mode 做完整验证。
 
 ## Target Path 规则
 
@@ -348,6 +377,9 @@ wrapper DaemonSet 需要：
 - 相同的 `TOKEN_AUDIENCE`；
 - host 上的 wrapper state 目录和 kubelet pod 目录；
 - `WRAPPER_MOUNT_STATE_DIR` 必须持久化到节点，并且只允许 wrapper 写入；
+- 如需自动创建缺失 subPath，显式设置
+  `WRAPPER_CREATE_MISSING_SUBPATHS=true`，并确认
+  `WRAPPER_CREATED_SUBPATH_MODE`、进程 umask 和 NFS export 权限；
 - Linux 节点 mount 能力；
 - 用于 TokenReview、Pod、PV、PVC 读取的 Kubernetes RBAC。
 

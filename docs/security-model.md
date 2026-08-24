@@ -60,6 +60,36 @@ For the dynamic path, the sandbox runtime invokes the mounter with a CSI
 `NodePublishVolumeRequest`. The workload container does not receive the wrapper
 socket or projected wrapper token.
 
+## Source SubPath Creation
+
+The wrapper normally requires a non-empty `source_sub_path` to exist. v0.0.2
+adds an opt-in node policy, `WRAPPER_CREATE_MISSING_SUBPATHS=true`, that creates
+missing directory components below the staged PV. It is disabled by default, so
+upgrading does not add NFS write behavior unless an operator enables it.
+
+The switch is global to a wrapper process. Every caller that passes the
+existing Pod, namespace, PV, and PVC checks can create any valid relative path
+inside that PV. v0.0.2 does not enforce an allowed subpath prefix or a separate
+"may create" permission, and a misspelled path can leave a persistent empty
+directory. Only trusted runtimes or sidecars should receive both the wrapper
+socket and projected token.
+
+Creation does not relax path validation. The path must remain relative, cannot
+contain `..` or NUL, and every existing component is opened without following
+symlinks and must be a directory. Newly created components request
+`WRAPPER_CREATED_SUBPATH_MODE` (default `0770`) through `mkdirat`, subject to
+the wrapper process umask and filesystem or NFS default ACLs. Existing
+components keep their owner and mode, and the wrapper does not `chmod` or
+`chown` new components.
+
+This policy adds a write to the NFS export and therefore needs an explicit
+permissions review. With `root_squash`, node-side root may be mapped to an
+anonymous UID/GID: creation can fail, or a successfully created directory can
+have ownership that prevents the workload from entering it. Pre-provision the
+directory with the intended UID/GID when ownership is part of the security
+boundary. Avoid widening the mode merely to bypass an unverified export,
+umask, default ACL, owner, or group configuration.
+
 ## Container Restart Reconciliation
 
 After the initial authenticated mount succeeds, the wrapper stores only the

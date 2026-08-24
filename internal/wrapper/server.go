@@ -39,6 +39,8 @@ type Server struct {
 
 const targetLockStripes = 128
 
+var errNodeOperation = errors.New("node operation failed")
+
 func NewServer(cfg config.WrapperConfig, kubeClient Kubernetes, mounter node.Mounter, logger *log.Logger) (*Server, error) {
 	state, err := newFileMountStateStore(cfg.MountStateDir)
 	if err != nil {
@@ -99,15 +101,7 @@ func (s *Server) handleMount(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.mount(ctx, token, request)
 	if err != nil {
-		status := http.StatusForbidden
-		if errors.Is(err, errBadRequest) {
-			status = http.StatusBadRequest
-		} else if errors.Is(err, node.ErrBadSourceSubPath) {
-			status = http.StatusBadRequest
-		} else if errors.Is(err, node.ErrMountDisabled) {
-			status = http.StatusServiceUnavailable
-		}
-		writeError(w, status, err.Error())
+		writeError(w, requestErrorStatus(err), err.Error())
 		return
 	}
 	writeData(w, http.StatusOK, result)
@@ -138,13 +132,7 @@ func (s *Server) handleUnmount(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.unmount(ctx, token, request)
 	if err != nil {
-		status := http.StatusForbidden
-		if errors.Is(err, errBadRequest) {
-			status = http.StatusBadRequest
-		} else if errors.Is(err, node.ErrMountDisabled) {
-			status = http.StatusServiceUnavailable
-		}
-		writeError(w, status, err.Error())
+		writeError(w, requestErrorStatus(err), err.Error())
 		return
 	}
 	writeData(w, http.StatusOK, result)
@@ -165,7 +153,7 @@ func (s *Server) mount(ctx context.Context, token string, request api.MountReque
 	if existed && sameMountIntent(previous, desired) && (previous.ContainerID == "" || previous.ContainerID == plan.ContainerID) {
 		mounted, err := s.mounter.IsMounted(ctx, plan)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(errNodeOperation, err)
 		}
 		if mounted {
 			return mountResult(s.cfg.DriverName, request), nil
@@ -176,7 +164,7 @@ func (s *Server) mount(ctx context.Context, token string, request api.MountReque
 		return nil, fmt.Errorf("persist desired mount: %w", err)
 	}
 	if err := s.mounter.Mount(ctx, plan); err != nil {
-		return nil, errors.Join(err, s.restoreDesiredMount(key, previous, existed))
+		return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
 	}
 	desired.ContainerID = plan.ContainerID
 	if err := s.state.Put(desired); err != nil {
@@ -227,11 +215,11 @@ func (s *Server) unmount(ctx context.Context, token string, request api.UnmountR
 	}
 	mounted, err := s.mounter.IsMounted(ctx, plan)
 	if err != nil {
-		return nil, errors.Join(err, s.restoreDesiredMount(key, previous, existed))
+		return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
 	}
 	if mounted {
 		if err := s.mounter.Unmount(ctx, plan); err != nil {
-			return nil, errors.Join(err, s.restoreDesiredMount(key, previous, existed))
+			return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
 		}
 	}
 
@@ -370,6 +358,19 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(api.Response{Error: message})
+}
+
+func requestErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errBadRequest), errors.Is(err, node.ErrBadSourceSubPath):
+		return http.StatusBadRequest
+	case errors.Is(err, node.ErrMountDisabled):
+		return http.StatusServiceUnavailable
+	case errors.Is(err, errNodeOperation):
+		return http.StatusInternalServerError
+	default:
+		return http.StatusForbidden
+	}
 }
 
 func bearerToken(header string) (string, error) {

@@ -115,7 +115,12 @@ func (m *linuxMounter) IsMounted(ctx context.Context, plan MountPlan) (bool, err
 }
 
 func (m *linuxMounter) bindMountWithModernAPI(targetPID int, stagePath, sourceSubPath, targetPath string) error {
-	sourceFD, sourceDescription, err := openTreeMountSource(stagePath, sourceSubPath)
+	sourceFD, sourceDescription, err := openTreeMountSource(
+		stagePath,
+		sourceSubPath,
+		m.cfg.CreateMissingSubPaths,
+		m.cfg.CreatedSubPathMode,
+	)
 	if err != nil {
 		return err
 	}
@@ -124,7 +129,12 @@ func (m *linuxMounter) bindMountWithModernAPI(targetPID int, stagePath, sourceSu
 }
 
 func (m *linuxMounter) bindMountWithLegacyAPI(targetPID int, stagePath, sourceSubPath, targetPath string) error {
-	source, err := openLegacyMountSource(stagePath, sourceSubPath)
+	source, err := openLegacyMountSource(
+		stagePath,
+		sourceSubPath,
+		m.cfg.CreateMissingSubPaths,
+		m.cfg.CreatedSubPathMode,
+	)
 	if err != nil {
 		return err
 	}
@@ -251,7 +261,7 @@ func mountNFS(ctx context.Context, pv PersistentVolume, target string) error {
 	return nil
 }
 
-func openTreeMountSource(stagePath, sourceSubPath string) (int, string, error) {
+func openTreeMountSource(stagePath, sourceSubPath string, createMissing bool, mode os.FileMode) (int, string, error) {
 	if sourceSubPath == "" {
 		fd, err := unix.OpenTree(unix.AT_FDCWD, stagePath, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
 		if err != nil {
@@ -260,31 +270,13 @@ func openTreeMountSource(stagePath, sourceSubPath string) (int, string, error) {
 		return fd, stagePath, nil
 	}
 
-	dirFD, err := unix.Open(stagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	sourceFD, err := openDirectoryNoFollow(stagePath, sourceSubPath, createMissing, mode)
 	if err != nil {
-		return -1, "", fmt.Errorf("open staged mount %s: %w", stagePath, err)
+		return -1, "", err
 	}
-	defer unix.Close(dirFD)
+	defer unix.Close(sourceFD)
 
-	currentFD := dirFD
-	for _, segment := range strings.Split(sourceSubPath, "/") {
-		if segment == "" || segment == "." {
-			continue
-		}
-		nextFD, err := unix.Openat(currentFD, segment, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return -1, "", fmt.Errorf("%w: open source_sub_path %s under staged mount %s: %v", ErrBadSourceSubPath, sourceSubPath, stagePath, err)
-		}
-		if currentFD != dirFD {
-			_ = unix.Close(currentFD)
-		}
-		currentFD = nextFD
-	}
-	if currentFD != dirFD {
-		defer unix.Close(currentFD)
-	}
-
-	fd, err := unix.OpenTree(currentFD, "", unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_EMPTY_PATH)
+	fd, err := unix.OpenTree(sourceFD, "", unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_EMPTY_PATH)
 	if err != nil {
 		return -1, "", fmt.Errorf("clone staged source_sub_path %s under %s: %w", sourceSubPath, stagePath, err)
 	}
@@ -304,40 +296,51 @@ func (s legacyMountSource) Path() string {
 	return filepath.Join("/proc/self/fd", strconv.Itoa(s.FD))
 }
 
-func openLegacyMountSource(stagePath, sourceSubPath string) (legacyMountSource, error) {
+func openLegacyMountSource(stagePath, sourceSubPath string, createMissing bool, mode os.FileMode) (legacyMountSource, error) {
 	sourcePath := stagePath
 	if sourceSubPath != "" {
 		sourcePath = filepath.Join(stagePath, sourceSubPath)
 	}
 
-	fd, err := openDirectoryNoFollow(stagePath, sourceSubPath)
+	fd, err := openDirectoryNoFollow(stagePath, sourceSubPath, createMissing, mode)
 	if err != nil {
 		return legacyMountSource{}, err
 	}
 	return legacyMountSource{FD: fd, Description: sourcePath}, nil
 }
 
-func openDirectoryNoFollow(stagePath, sourceSubPath string) (int, error) {
-	dirFD, err := unix.Open(stagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+func openDirectoryNoFollow(stagePath, sourceSubPath string, createMissing bool, mode os.FileMode) (int, error) {
+	segments, err := sourceSubPathSegments(sourceSubPath)
+	if err != nil {
+		return -1, err
+	}
+
+	dirFD, err := unix.Open(stagePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, fmt.Errorf("open staged mount %s: %w", stagePath, err)
 	}
-	if sourceSubPath == "" {
+	if len(segments) == 0 {
 		return dirFD, nil
 	}
 
 	currentFD := dirFD
-	for _, segment := range strings.Split(sourceSubPath, "/") {
-		if segment == "" || segment == "." {
-			continue
-		}
+	for _, segment := range segments {
 		nextFD, err := unix.Openat(currentFD, segment, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			if currentFD != dirFD {
-				_ = unix.Close(currentFD)
+		if errors.Is(err, unix.ENOENT) && createMissing {
+			mkdirErr := unix.Mkdirat(currentFD, segment, createdSubPathUnixMode(mode))
+			if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
+				closeDirectoryWalkFDs(dirFD, currentFD)
+				return -1, sourceSubPathCreateError(sourceSubPath, stagePath, mkdirErr)
 			}
-			_ = unix.Close(dirFD)
-			return -1, fmt.Errorf("%w: open source_sub_path %s under staged mount %s: %v", ErrBadSourceSubPath, sourceSubPath, stagePath, err)
+			nextFD, err = unix.Openat(currentFD, segment, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				closeDirectoryWalkFDs(dirFD, currentFD)
+				return -1, sourceSubPathOpenError(sourceSubPath, stagePath, err, false)
+			}
+		}
+		if err != nil {
+			closeDirectoryWalkFDs(dirFD, currentFD)
+			return -1, sourceSubPathOpenError(sourceSubPath, stagePath, err, !createMissing)
 		}
 		if currentFD != dirFD {
 			_ = unix.Close(currentFD)
@@ -349,6 +352,67 @@ func openDirectoryNoFollow(stagePath, sourceSubPath string) (int, error) {
 	}
 	_ = unix.Close(dirFD)
 	return currentFD, nil
+}
+
+func sourceSubPathOpenError(sourceSubPath, stagePath string, err error, missingIsBad bool) error {
+	badPath := errors.Is(err, unix.ENOTDIR) ||
+		errors.Is(err, unix.ELOOP) ||
+		errors.Is(err, unix.ENAMETOOLONG) ||
+		(missingIsBad && errors.Is(err, unix.ENOENT))
+	if badPath {
+		return fmt.Errorf("%w: open source_sub_path %s under staged mount %s: %v", ErrBadSourceSubPath, sourceSubPath, stagePath, err)
+	}
+	return fmt.Errorf("open source_sub_path %s under staged mount %s: %w", sourceSubPath, stagePath, err)
+}
+
+func sourceSubPathCreateError(sourceSubPath, stagePath string, err error) error {
+	return fmt.Errorf("create source_sub_path %s under staged mount %s: %w", sourceSubPath, stagePath, err)
+}
+
+func sourceSubPathSegments(sourceSubPath string) ([]string, error) {
+	if filepath.IsAbs(sourceSubPath) {
+		return nil, fmt.Errorf("%w: source_sub_path %s must be relative", ErrBadSourceSubPath, sourceSubPath)
+	}
+
+	var segments []string
+	for _, segment := range strings.Split(sourceSubPath, "/") {
+		switch segment {
+		case "", ".":
+			continue
+		case "..":
+			return nil, fmt.Errorf("%w: source_sub_path %s must not contain ..", ErrBadSourceSubPath, sourceSubPath)
+		default:
+			if strings.IndexByte(segment, 0) >= 0 {
+				return nil, fmt.Errorf("%w: source_sub_path contains NUL byte", ErrBadSourceSubPath)
+			}
+			segments = append(segments, segment)
+		}
+	}
+	return segments, nil
+}
+
+func createdSubPathUnixMode(mode os.FileMode) uint32 {
+	if mode == 0 {
+		mode = DefaultCreatedSubPathMode
+	}
+	unixMode := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		unixMode |= unix.S_ISUID
+	}
+	if mode&os.ModeSetgid != 0 {
+		unixMode |= unix.S_ISGID
+	}
+	if mode&os.ModeSticky != 0 {
+		unixMode |= unix.S_ISVTX
+	}
+	return unixMode
+}
+
+func closeDirectoryWalkFDs(dirFD, currentFD int) {
+	if currentFD != dirFD {
+		_ = unix.Close(currentFD)
+	}
+	_ = unix.Close(dirFD)
 }
 
 func findContainerPID(procRoot, podUID, containerID string) (int, error) {

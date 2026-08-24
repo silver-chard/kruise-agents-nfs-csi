@@ -8,27 +8,29 @@ imagePullSecrets: []
 
 images:
   wrapper:
-    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
-    tag: 0.0.1-beta.12
+    # Build and publish this image before installing the chart.
+    repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
+    tag: v0.0.2
     pullPolicy: IfNotPresent
   mounter:
-    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-mounter
-    tag: 0.0.1-beta.12
+    # Build and publish this image before using the sidecar integration.
+    repository: ghcr.io/example/kruise-agents-nfs-csi-mounter
+    tag: v0.0.2
     pullPolicy: IfNotPresent
   provisioner:
-    repository: iregistry.baidu-int.com/cnap-cluster/csi-provisioner
+    repository: registry.k8s.io/sig-storage/csi-provisioner
     tag: v6.1.0
     pullPolicy: IfNotPresent
   resizer:
-    repository: iregistry.baidu-int.com/cnap-cluster/csi-resizer
+    repository: registry.k8s.io/sig-storage/csi-resizer
     tag: v2.0.0
     pullPolicy: IfNotPresent
   registrar:
-    repository: iregistry.baidu-int.com/cnap-cluster/csi-node-driver-registrar
+    repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
     tag: v2.15.0
     pullPolicy: IfNotPresent
   livenessProbe:
-    repository: iregistry.baidu-int.com/cnap-cluster/livenessprobe
+    repository: registry.k8s.io/sig-storage/livenessprobe
     tag: v2.17.0
     pullPolicy: IfNotPresent
 
@@ -73,6 +75,8 @@ paths:
 wrapper:
   enableMount: true
   unstageAfterMount: true
+  createMissingSubPaths: false
+  createdSubPathMode: "0770"
   socketGroup: 2000
   socketDirMode: "0770"
   socketMode: "0660"

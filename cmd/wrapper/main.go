@@ -20,19 +20,12 @@ import (
 )
 
 func main() {
-	cfg := config.LoadWrapperConfig()
+	cfg, err := config.LoadWrapperConfig()
+	if err != nil {
+		log.Fatalf("load wrapper config: %v", err)
+	}
 
-	flag.StringVar(&cfg.DriverName, "driver-name", cfg.DriverName, "CSI driver name")
-	flag.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Unix socket path")
-	flag.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "projected service account token audience")
-	flag.StringVar(&cfg.KubeTokenFile, "kube-token-file", cfg.KubeTokenFile, "wrapper service account token file")
-	flag.StringVar(&cfg.KubeCAFile, "kube-ca-file", cfg.KubeCAFile, "Kubernetes CA file")
-	flag.StringVar(&cfg.StagingRoot, "staging-root", cfg.StagingRoot, "node staging root")
-	flag.StringVar(&cfg.MountStateDir, "mount-state-dir", cfg.MountStateDir, "persistent desired mount state directory")
-	flag.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name used to watch local pods")
-	flag.StringVar(&cfg.HostProcRoot, "host-proc-root", cfg.HostProcRoot, "host proc root visible to wrapper")
-	flag.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
-	flag.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
+	bindWrapperFlags(flag.CommandLine, &cfg)
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "kruise-nfs-wrapper ", log.LstdFlags|log.LUTC)
@@ -43,12 +36,14 @@ func main() {
 	}
 
 	nodeMounter := node.NewMounter(node.Config{
-		DriverName:        cfg.DriverName,
-		StagingRoot:       cfg.StagingRoot,
-		HostProcRoot:      cfg.HostProcRoot,
-		EnableMount:       cfg.EnableMount,
-		UnstageAfterMount: cfg.UnstageAfterMount,
-		Timeout:           cfg.RequestTimeout,
+		DriverName:            cfg.DriverName,
+		StagingRoot:           cfg.StagingRoot,
+		HostProcRoot:          cfg.HostProcRoot,
+		EnableMount:           cfg.EnableMount,
+		UnstageAfterMount:     cfg.UnstageAfterMount,
+		CreateMissingSubPaths: cfg.CreateMissingSubPaths,
+		CreatedSubPathMode:    cfg.CreatedSubPathMode,
+		Timeout:               cfg.RequestTimeout,
 	})
 	if cfg.UnstageAfterMount {
 		if err := node.CleanupStagingRoot(cfg.StagingRoot); err != nil {
@@ -96,6 +91,42 @@ func main() {
 			logger.Fatalf("server failed: %v", err)
 		}
 	}
+}
+
+func bindWrapperFlags(flagSet *flag.FlagSet, cfg *config.WrapperConfig) {
+	flagSet.StringVar(&cfg.DriverName, "driver-name", cfg.DriverName, "CSI driver name")
+	flagSet.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Unix socket path")
+	flagSet.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "projected service account token audience")
+	flagSet.StringVar(&cfg.KubeTokenFile, "kube-token-file", cfg.KubeTokenFile, "wrapper service account token file")
+	flagSet.StringVar(&cfg.KubeCAFile, "kube-ca-file", cfg.KubeCAFile, "Kubernetes CA file")
+	flagSet.StringVar(&cfg.StagingRoot, "staging-root", cfg.StagingRoot, "node staging root")
+	flagSet.StringVar(&cfg.MountStateDir, "mount-state-dir", cfg.MountStateDir, "persistent desired mount state directory")
+	flagSet.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name used to watch local pods")
+	flagSet.StringVar(&cfg.HostProcRoot, "host-proc-root", cfg.HostProcRoot, "host proc root visible to wrapper")
+	flagSet.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
+	flagSet.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
+	flagSet.BoolVar(&cfg.CreateMissingSubPaths, "create-missing-subpaths", cfg.CreateMissingSubPaths, "create missing source subPath directories")
+	flagSet.Var(&fileModeValue{target: &cfg.CreatedSubPathMode}, "created-subpath-mode", "Unix mode for newly created source subPath directories")
+}
+
+type fileModeValue struct {
+	target *os.FileMode
+}
+
+func (value *fileModeValue) String() string {
+	if value == nil || value.target == nil {
+		return ""
+	}
+	return config.FormatFileMode(*value.target)
+}
+
+func (value *fileModeValue) Set(raw string) error {
+	mode, err := config.ParseFileMode(raw)
+	if err != nil {
+		return err
+	}
+	*value.target = mode
+	return nil
 }
 
 func listenUnix(socketPath string, mode os.FileMode) (net.Listener, error) {

@@ -1,168 +1,222 @@
 # kruise-agents-nfs-csi
 
-This repository starts a lightweight wrapper around upstream
-`nfs.csi.k8s.io` for OpenKruise sandbox dynamic mounts.
+`kruise-agents-nfs-csi` adds low-privilege, on-demand NFS mounts to
+OpenKruise runtimes and other trusted Kubernetes sidecars while preserving the
+upstream `nfs.csi.k8s.io` provisioning behavior.
 
-The design keeps the upstream NFS CSI driver behavior in place and adds a
-small node-side agent beside it. The OpenKruise agent-runtime sidecar runs a
-low-privilege mounter client. The client talks to the node wrapper through a
-Unix domain socket. It never mounts filesystems, never gets `SYS_ADMIN`, never
-mounts host `/proc`, and never talks to the CSI socket directly.
+A trusted mounter client sends an authenticated request over a Unix domain
+socket. The node wrapper validates the projected service account token and the
+live Pod/PV/PVC relationship, then performs the mount in the target container's
+mount namespace. The client itself does not mount filesystems, receive
+`SYS_ADMIN`, mount host `/proc`, or access the CSI socket.
 
-Default CSI driver name:
+The default CSI driver name is `csi.nfs.zhida`. Set the same `DRIVER_NAME` in
+the wrapper and mounter when a deployment uses a different name.
 
-```text
-csi.nfs.zhida
+## What's new in v0.0.2
+
+- The supported integration surfaces are documented as a direct mounter binary
+  call, an OpenKruise CSI `NodePublishVolumeRequest` call, and a Go SDK.
+- The wrapper can optionally create a missing `source_sub_path` safely before
+  mounting it. This is disabled by default for backward compatibility.
+- Created directory mode is configurable. The default mode passed to `mkdirat`
+  is `0770`; the effective mode is still restricted by the wrapper process
+  umask, filesystem or NFS default ACLs, and server policy.
+
+## Architecture
+
+- `cmd/wrapper` runs on each Linux node. It owns TokenReview, Kubernetes object
+  validation, path checks, mount namespace operations, and desired-mount state.
+- `cmd/mounter` is the `kruise-nfs-mounter` low-privilege command-line client.
+- `mounter` is the public Go SDK for trusted runtime and sidecar integrations.
+- `internal/node` contains the Linux mount implementation. Non-Linux builds
+  return an explicit unsupported error for mount operations.
+
+The wrapper stages an NFS PV only long enough to move or clone the selected
+mount into the target container namespace. By default it then unmounts the
+staging source (`WRAPPER_UNSTAGE_AFTER_MOUNT=true`). Successful mounts are
+stored as root-only node state without bearer tokens or NFS credentials. If a
+container ID changes for the same Pod UID, a node-filtered informer triggers
+live revalidation and restores the mount in the replacement namespace.
+
+## Prerequisites
+
+All three integration styles require:
+
+- a Linux node running the wrapper and the upstream NFS CSI components;
+- a Bound CSI PV/PVC whose driver name matches the wrapper configuration;
+- a trusted runtime or sidecar with the wrapper socket mounted;
+- a projected service account token with the configured audience;
+- Pod namespace, name, and UID from the Downward API; and
+- the target container name, or an unambiguous target container.
+
+Do not mount the wrapper socket or its projected token into untrusted workload
+code. See [Security Model](docs/security-model.md) for the full trust boundary.
+
+## Usage
+
+### 1. Call the mounter binary directly
+
+Use direct mode when a trusted sidecar already knows the PV, optional subpath,
+and target path:
+
+```sh
+kruise-nfs-mounter mount \
+  --driver csi.nfs.zhida \
+  --namespace "${POD_NAMESPACE}" \
+  --pod-name "${POD_NAME}" \
+  --pod-uid "${POD_UID}" \
+  --pv "${PV_NAME}" \
+  --sub-path users/alice/workspace \
+  --target /workspace/data \
+  --container main
 ```
 
-The driver name is configurable through the same `DRIVER_NAME` setting in the
-wrapper, mounter, Docker entrypoint, and demo chart.
+The socket and token default to
+`/var/lib/kruise-agents-nfs-csi/wrapper.sock` and
+`/var/run/secrets/kruise-agents-nfs-csi/token`. Override them with
+`--socket-path` and `--token-file`, or with `WRAPPER_SOCKET_PATH` and
+`PROJECTED_TOKEN_FILE`.
 
-The wrapper stages each NFS PV on the node only long enough to clone it into
-the target container mount namespace. By default it then unmounts that staging
-source (`WRAPPER_UNSTAGE_AFTER_MOUNT=true`). This keeps node mount tables from
-growing with the total number of PVs that have ever been dynamically mounted on
-the node. Set it to `false` only when intentionally trading node mount-table
-growth for repeated-mount reuse of the same staged PV.
+See [Standalone mounter](docs/standalone-mounter.md) for the Pod wiring and
+unmount example.
 
-Successful dynamic mounts are also recorded as one root-only node state file per mount.
-Each wrapper uses one node-filtered Kubernetes `SharedIndexInformer`, and when
-the same Pod UID gets a new target container ID, re-validates the Pod/PV/PVC
-relationship and mounts the volume into the replacement container namespace.
-The informer owns LIST/WATCH cache synchronization and reconnection; the wrapper
-does not poll every Pod.
-Explicit unmount removes the desired state so reconciliation cannot recreate
-it. The state files never contain the projected bearer token or NFS credentials.
+### 2. Let OpenKruise invoke the mounter
 
-## Components
+An OpenKruise runtime can pass its CSI `NodePublishVolumeRequest` protobuf as
+base64:
 
-- `cmd/wrapper`: node DaemonSet agent that listens on a Unix socket, performs
-  TokenReview, validates live Pod/PV state, rejects dangerous target paths, and
-  delegates mount work to the node-side mount implementation.
-- `cmd/mounter`: low-privilege sidecar client invoked by sandbox runtime. It
-  reads a projected service account token and calls the wrapper socket API.
-- `mounter`: public Go SDK for trusted runtime and sidecar integrations. It
-  uses the same low-privilege wrapper UDS API as `cmd/mounter`; importing it
-  does not embed the node mounter or wrapper.
-- `internal/api`: stable JSON request and response types.
-- `internal/kube`: minimal in-cluster Kubernetes REST client using only the Go
-  standard library.
-- `internal/node`: node mount interface. Linux builds contain the initial NFS
-  stage and mount-namespace bind implementation; non-Linux builds return an
-  explicit unsupported error.
-- `demo`: SandboxSet, sandbox inject ConfigMap, PV/PVC, and chart demo files.
+```sh
+kruise-nfs-mounter mount \
+  --driver csi.nfs.zhida \
+  --config "${NODE_PUBLISH_VOLUME_REQUEST_BASE64}" \
+  --container main
+```
 
-## Security Model
+The mounter derives the PV name, target path, and optional source subpath from
+the CSI request, then calls the same wrapper API as direct mode. The value of
+`--config` is a base64-encoded protobuf message, not JSON. Pod identity should
+be injected through `POD_NAMESPACE`, `POD_NAME`, and `POD_UID` or their
+projected-file fallbacks.
 
-The dangerous operations are concentrated in the node DaemonSet wrapper:
+See [User API](docs/api.md#运行时命令) for accepted CSI context keys and the
+matching unmount command.
 
-- the mounter is not privileged;
-- the mounter does not need `SYS_ADMIN`;
-- the mounter does not mount host `/proc`;
-- the mounter is only an API client over UDS;
-- the wrapper validates projected service account tokens with TokenReview;
-- the wrapper re-checks Pod and PV state from the apiserver;
-- the wrapper re-checks the live PVC bound by the PV claimRef;
-- after a target container restart, the wrapper re-checks the live Pod, PV, and
-  PVC before restoring the mount in the new container namespace;
-- the wrapper only allows the configured CSI driver;
-- the wrapper rejects dangerous target paths such as `/`, `/proc`, `/sys`,
-  `/dev`, and Kubernetes secret paths;
-- if the target path is already a mount point during mount, the wrapper returns
-  an error and does not unmount it automatically;
-- active unmount is exposed as a separate authenticated wrapper operation.
+### 3. Use the Go SDK
 
-See [docs/security-model.md](docs/security-model.md) for details.
+Trusted Go runtimes can avoid a child process:
 
-## Cloud NFS Setup
+```go
+client, err := mounter.NewClient(mounter.Config{
+    DriverName:  "csi.nfs.zhida",
+    SocketPath:  "/var/lib/kruise-agents-nfs-csi/wrapper.sock",
+    TokenFile:   "/var/run/secrets/kruise-agents-nfs-csi/token",
+    HTTPTimeout: 15 * time.Second,
+})
+if err != nil {
+    return err
+}
+defer client.CloseIdleConnections()
 
-For GCP Filestore or any managed NFS endpoint, see the Chinese setup checklist
-in [docs/gcp-filestore.md](docs/gcp-filestore.md). The key requirement is that
-the configured NFS share must be writable by the CSI controller node so the
-upstream NFS CSI driver can create PVC subdirectories during dynamic
-provisioning.
+result, err := client.Mount(ctx, mounter.MountRequest{
+    Namespace:     podNamespace,
+    PodName:       podName,
+    PodUID:        podUID,
+    PVName:        pvName,
+    SourceSubPath: "users/alice/workspace",
+    TargetPath:    "/workspace/data",
+    ContainerName: "main",
+})
+```
 
-## Local Validation
+Install the SDK with:
+
+```sh
+go get github.com/silver-chard/kruise-agents-nfs-csi/mounter@v0.0.2
+```
+
+The SDK uses the same UDS protocol, token rotation behavior, validation, and
+reconciliation as the binary. Keep the SDK and node wrapper on the same release
+version. See [Go SDK guide](docs/sdk.md) for a complete example and error
+handling.
+
+## Optional creation of a missing SourceSubPath
+
+By default, a non-empty `source_sub_path` must already be a directory in the
+PV. v0.0.2 adds an opt-in wrapper policy that creates missing path components
+before the bind mount:
+
+| Setting | Environment variable | Wrapper flag | Helm value | Default |
+| --- | --- | --- | --- | --- |
+| Enable creation | `WRAPPER_CREATE_MISSING_SUBPATHS` | `--create-missing-subpaths` | `wrapper.createMissingSubPaths` | `false` |
+| Requested directory mode | `WRAPPER_CREATED_SUBPATH_MODE` | `--created-subpath-mode` | `wrapper.createdSubPathMode` | `0770` |
+
+Example wrapper configuration:
+
+```sh
+WRAPPER_CREATE_MISSING_SUBPATHS=true
+WRAPPER_CREATED_SUBPATH_MODE=0770
+```
+
+The mode is parsed strictly as octal in the range `0001` through `07777`;
+`0000` or an invalid value prevents the wrapper from starting. Each `mkdirat`
+call uses the requested mode, while the effective mode is subject to the
+wrapper process umask and filesystem or NFS default ACLs. Existing components
+keep their current owner and mode. The wrapper does not `chmod` or `chown` new
+or existing directories, and successfully created parent components are not
+rolled back if a later component fails.
+
+Path validation is unchanged: the path must be relative, cannot contain `..`
+or NUL, and no existing component may be a symlink or non-directory. A missing
+path while creation is disabled, or any unsafe path, returns HTTP `400`. After
+authorization succeeds, storage failures such as `EACCES`, `EROFS`, `ENOSPC`,
+or `EDQUOT` during creation are node-operation failures and return HTTP `500`.
+
+This is a wrapper-wide policy, not a per-request permission. Every trusted
+client that passes the existing PV checks can create any valid relative path in
+that PV; there is no `allowedSubPathPrefix` authorization in v0.0.2. A typo can
+therefore leave a persistent empty directory. Keep the socket and projected
+token limited to trusted runtimes or sidecars.
+
+NFS export permissions still decide whether creation succeeds. With
+`root_squash`, the wrapper's root identity is commonly mapped to an anonymous
+UID/GID, so creation may be denied or the resulting owner may not match the
+workload. Mode `0770` can then leave the workload unable to enter the directory.
+Prefer pre-provisioning directories with the intended UID/GID when ownership
+matters, or deliberately align export policy, anonymous identity, process
+umask, default ACLs, group ownership, and requested mode before enabling
+automatic creation.
+
+## Build and validate
+
+Build the two binaries directly from source:
+
+```sh
+mkdir -p bin
+go build -o bin/kruise-nfs-wrapper ./cmd/wrapper
+go build -o bin/kruise-nfs-mounter ./cmd/mounter
+```
+
+Or run `scripts/build.sh` to format, test, vet, and build static Linux/amd64
+binaries into `dist/linux-amd64`.
+
+Run the project checks:
 
 ```sh
 gofmt -w ./cmd ./internal ./mounter
 go test ./...
 go vet ./...
-go build ./cmd/wrapper ./cmd/mounter
+GOOS=linux GOARCH=amd64 go build ./cmd/wrapper ./cmd/mounter
+helm lint charts/kruise-agents-nfs-csi
 ```
 
-`internal/node` performs real mount operations only on Linux. Local macOS builds
-compile the same wrapper API but return `node mount is only supported on linux`
-if the wrapper receives a mount request.
+For managed NFS export permissions and `root_squash` troubleshooting, see
+[GCP Filestore setup](docs/gcp-filestore.md).
 
-## Images
+## API and security references
 
-The wrapper image is built from the upstream NFS CSI image so it keeps the
-original `nfsplugin` binary and adds the wrapper agent:
-
-```sh
-REGISTRY=iregistry.baidu-int.com/cnap-cluster \
-VERSION=0.0.1-beta.12 \
-BASE_IMAGE=iregistry.baidu-int.com/baidu-base/ubuntu:resolute \
-UPSTREAM_NFS_CSI_IMAGE=iregistry.baidu-int.com/cnap-cluster/nfsplugin:v4.13.2 \
-scripts/build.sh
-```
-
-The mounter sidecar can be built separately:
-
-```sh
-PUSH=1 scripts/build.sh
-```
-
-## API
-
-There are three supported integration styles:
-
-1. invoke the `kruise-nfs-mounter` binary directly;
-2. let an OpenKruise runtime invoke the same binary with a CSI
-   `NodePublishVolumeRequest`;
-3. import `github.com/silver-chard/kruise-agents-nfs-csi/mounter` as a Go SDK.
-
-All three are low-privilege clients of the same wrapper Unix socket. The Go SDK
-does not mount filesystems directly, does not need `SYS_ADMIN`, and should run
-only in a trusted runtime or sidecar that receives the wrapper socket,
-projected token, and Downward API Pod identity.
-
-For the user-facing command, SDK, and wrapper API contract, see
-[docs/api.md](docs/api.md). The complete Go SDK guide is
-[docs/sdk.md](docs/sdk.md). For non-Kruise workloads that call the mounter
-directly, see [docs/standalone-mounter.md](docs/standalone-mounter.md).
-
-The wrapper listens on a Unix socket, by default:
-
-```text
-/var/lib/kruise-agents-nfs-csi/wrapper.sock
-```
-
-Mount requests use JSON over HTTP on UDS:
-
-```json
-{
-  "api_version": "kruise-agents-nfs-csi.zhida/v1alpha1",
-  "driver_name": "csi.nfs.zhida",
-  "namespace": "example",
-  "pod_name": "sandbox-demo-0",
-  "pod_uid": "00000000-0000-0000-0000-000000000000",
-  "pv_name": "pv-sandbox-nfs-demo",
-  "source_sub_path": "users/alice/workspace",
-  "target_path": "/workspace/data",
-  "container_name": "main"
-}
-```
-
-Responses use the project convention:
-
-```json
-{"data":{"mounted":true}}
-```
-
-or:
-
-```json
-{"error":"target path /proc/data is not allowed"}
-```
+- [User-facing commands and wrapper API](docs/api.md)
+- [Go SDK guide](docs/sdk.md)
+- [Standalone mounter](docs/standalone-mounter.md)
+- [Wrapper protocol](docs/protocol.md)
+- [Security model](docs/security-model.md)

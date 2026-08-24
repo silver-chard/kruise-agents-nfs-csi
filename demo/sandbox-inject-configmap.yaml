@@ -9,7 +9,8 @@ data:
     wrapper_socket_path: /var/lib/kruise-agents-nfs-csi/wrapper.sock
     token_audience: kruise-agents-nfs-csi.zhida/sandbox-mounter
     mounter:
-      image: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-mounter:0.0.1-beta.12
+      # Build and publish this image before deploying the demo.
+      image: ghcr.io/example/kruise-agents-nfs-csi-mounter:v0.0.2
       restart_policy: Always
       command:
         - sh

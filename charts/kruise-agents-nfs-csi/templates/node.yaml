@@ -118,6 +118,10 @@ spec:
               value: {{ .Values.wrapper.enableMount | quote }}
             - name: WRAPPER_UNSTAGE_AFTER_MOUNT
               value: {{ .Values.wrapper.unstageAfterMount | quote }}
+            - name: WRAPPER_CREATE_MISSING_SUBPATHS
+              value: {{ .Values.wrapper.createMissingSubPaths | quote }}
+            - name: WRAPPER_CREATED_SUBPATH_MODE
+              value: {{ .Values.wrapper.createdSubPathMode | quote }}
             - name: NODE_ID
               valueFrom:
                 fieldRef:

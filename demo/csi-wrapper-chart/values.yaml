@@ -6,8 +6,9 @@ wrapper:
     name: csi-nfs-node-sa
     namespace: kube-system
   image:
-    repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
-    tag: 0.0.1-beta.12
+    # Build and publish this image before deploying the demo.
+    repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
+    tag: v0.0.2
     pullPolicy: IfNotPresent
   socketHostPath: /var/lib/kruise-agents-nfs-csi
   stagingHostPath: /var/lib/kruise-agents-nfs-csi/staging
@@ -31,8 +32,8 @@ csi-driver-nfs:
     # preserving upstream sidecars, sockets, and CSI behavior.
     nfs:
       image:
-        repository: iregistry.baidu-int.com/cnap-cluster/kruise-agents-nfs-csi-wrapper
-        tag: 0.0.1-beta.12
+        repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
+        tag: v0.0.2
         pullPolicy: IfNotPresent
       env:
         - name: DRIVER_NAME

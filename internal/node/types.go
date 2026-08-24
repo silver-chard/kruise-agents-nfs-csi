@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 )
 
@@ -11,13 +12,20 @@ var (
 	ErrBadSourceSubPath = errors.New("bad source subpath")
 )
 
+// DefaultCreatedSubPathMode is the default permission mode requested for
+// source subpath directories created by the node mounter. The process umask
+// still applies, and existing directory modes are never changed.
+const DefaultCreatedSubPathMode os.FileMode = 0o770
+
 type Config struct {
-	DriverName        string
-	StagingRoot       string
-	HostProcRoot      string
-	EnableMount       bool
-	UnstageAfterMount bool
-	Timeout           time.Duration
+	DriverName            string
+	StagingRoot           string
+	HostProcRoot          string
+	EnableMount           bool
+	UnstageAfterMount     bool
+	CreateMissingSubPaths bool
+	CreatedSubPathMode    os.FileMode
+	Timeout               time.Duration
 }
 
 type PersistentVolume struct {

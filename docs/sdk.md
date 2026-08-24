@@ -27,6 +27,10 @@ SDK 调用进程会持有 wrapper socket 和 projected service account token，�
 4. 知道要挂载的 PV、目标业务容器和容器内目标路径。
 5. 使用与 wrapper 和 PV `spec.csi.driver` 相同的 driver name。
 
+`MountRequest.SourceSubPath` 非空时，目录默认必须已经存在。v0.0.2 可以在
+wrapper 启动时通过 `WRAPPER_CREATE_MISSING_SUBPATHS=true` 开启缺失目录创建；
+这是节点级策略，不是 SDK 的单次请求选项。
+
 SDK 本身不需要 Kubernetes RBAC。TokenReview 以及 Pod、PV、PVC 查询由节点
 wrapper 的 service account 完成。
 
@@ -291,6 +295,14 @@ API 注入，不应手工伪造。
 `Mount` 会把请求编码为 `POST /v1/mount`，并携带当前
 `TokenFile` 中的 bearer token。wrapper 成功完成实时校验和节点挂载后返回
 `MountResult`。
+
+`SourceSubPath` 必须是 PV 内安全的相对目录路径。默认情况下它必须已存在；wrapper
+开启 `WRAPPER_CREATE_MISSING_SUBPATHS` 后可以逐级创建缺失目录，请求 mode 由
+`WRAPPER_CREATED_SUBPATH_MODE` 控制（默认 `0770`）并传给 `mkdirat`。实际 mode
+受 wrapper 进程 umask、文件系统/NFS default ACL 和 export policy 影响，wrapper
+不会 `chmod` 或 `chown`。在启用
+`root_squash` 的 export 上，应先验证匿名 UID/GID 是否能创建目录，并确认业务
+容器能访问创建后的 owner/group/mode。
 
 重复发送相同 Pod、container、target 和 PV 的请求用于处理调用方未收到成功响应的
 情况。不要用不同 PV 或 subPath 隐式替换同一个 target；应先显式 unmount。
