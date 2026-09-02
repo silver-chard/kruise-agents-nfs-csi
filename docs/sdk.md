@@ -21,8 +21,8 @@ SDK 调用进程会持有 wrapper socket 和 projected service account token，�
 
 1. 能访问本节点 wrapper socket，例如
    `/var/lib/kruise-agents-nfs-csi/wrapper.sock`。
-2. 能读取 audience 与 wrapper `TOKEN_AUDIENCE` 一致的 projected service
-   account token。
+2. 能读取 audience 与 wrapper `TOKEN_AUDIENCE` 一致、且绑定当前 Pod 的
+   projected service account token。
 3. 通过 Downward API 获得当前 Pod 的 namespace、name 和 UID。
 4. 知道要挂载的 PV、目标业务容器和容器内目标路径。
 5. 使用与 wrapper 和 PV `spec.csi.driver` 相同的 driver name。
@@ -31,8 +31,17 @@ SDK 调用进程会持有 wrapper socket 和 projected service account token，�
 wrapper 启动时通过 `WRAPPER_CREATE_MISSING_SUBPATHS=true` 开启缺失目录创建；
 这是节点级策略，不是 SDK 的单次请求选项。
 
-SDK 本身不需要 Kubernetes RBAC。TokenReview 以及 Pod、PV、PVC 查询由节点
-wrapper 的 service account 完成。
+SDK 本身不需要 Kubernetes RBAC。TokenReview 以及 Pod、PV 查询由节点
+wrapper 的 service account 完成。PV 不需要 PVC 或 `claimRef`；wrapper
+不使用它们作为 mount 授权，授权由实时 Pod identity 和 PV annotation 决定。
+
+token 必须来自当前 Pod 的 `serviceAccountToken` projected volume。wrapper
+要求 TokenReview `status.user.extra` 中恰好各有一个
+`authentication.kubernetes.io/pod-name` 和
+`authentication.kubernetes.io/pod-uid`，并与请求和实时 Pod 精确匹配。
+未绑定 Pod 的长期 ServiceAccount token 会被拒绝；默认路径
+`/var/run/secrets/kubernetes.io/serviceaccount/token` 通常面向 Kubernetes API，
+不应替代下面的专用 audience token。
 
 下面是调用容器需要的关键 Pod 配置片段。socket group 应与 wrapper 部署配置一致：
 
@@ -72,6 +81,21 @@ volumes:
             expirationSeconds: 3600
 ```
 
+PV 可以用下面两个可选 annotation 收敛授权：
+
+```yaml
+metadata:
+  annotations:
+    kary.dev/allow-namespace: "dynamic-nfs-demo"
+    kary.dev/allow-serviceaccount: "dynamic-nfs-mounter"
+```
+
+每个 key 完全缺失表示该维度不限制；存在时按逗号分隔、`TrimSpace`
+后的值做区分大小写的精确匹配。两个 key 同时存在时按 AND。空值、空项和
+`*` 都是非法配置并 fail closed；需要不限制时应删除相应 key。两个 key
+都缺失意味着任何能通过 exact Pod token、socket、driver 和路径检查的
+可信 caller 都可以请求该 PV。
+
 ## 安装与配置
 
 ```sh
@@ -82,10 +106,11 @@ go get github.com/silver-chard/kruise-agents-nfs-csi/mounter
 
 ```go
 client, err := mounter.NewClient(mounter.Config{
-    DriverName:  "csi.nfs.zhida",
-    SocketPath:  "/var/lib/kruise-agents-nfs-csi/wrapper.sock",
-    TokenFile:   "/var/run/secrets/kruise-agents-nfs-csi/token",
-    HTTPTimeout: 15 * time.Second,
+    DriverName:        "csi.nfs.zhida",
+    SocketPath:        "/var/lib/kruise-agents-nfs-csi/wrapper.sock",
+    TokenFile:         "/var/run/secrets/kruise-agents-nfs-csi/token",
+    ExportRootKeyFile: "/var/run/secrets/kruise-agents-nfs-csi-root/key", // 仅需 export root 时配置
+    HTTPTimeout:       15 * time.Second,
 })
 ```
 
@@ -96,6 +121,7 @@ client, err := mounter.NewClient(mounter.Config{
 | `DriverName` | 是 | 必须与 wrapper 配置和 PV CSI driver 一致。 |
 | `SocketPath` | 是 | SDK 容器内可见的 wrapper Unix socket。 |
 | `TokenFile` | 是 | projected service account token 文件。 |
+| `ExportRootKeyFile` | 否 | NFS export root capability key 文件；只在有效 NFS 路径是 share root 时需要。 |
 | `HTTPTimeout` | 否 | UDS HTTP 请求超时；为 `0` 时默认 15 秒，不能为负数。 |
 | `DisableHTTPTimeout` | 否 | 显式关闭 client 级超时；通常应保持为 `false`，并为每次调用传入有界 context。 |
 
@@ -103,8 +129,40 @@ client, err := mounter.NewClient(mounter.Config{
 `Mount` 和 `Unmount` 会在访问 token 或 wrapper 前检查 namespace、Pod name、
 Pod UID、PV name 和 target path 是否为空。
 `Mount` 和 `Unmount` 每次调用都会重新读取 `TokenFile`，因此长生命周期
-进程可以使用 Kubernetes 自动轮换后的 projected token。`Health` 不需要读取
-token。
+进程可以使用 Kubernetes 自动轮换后的 projected token。配置
+`ExportRootKeyFile` 后，`Mount` 还会每次重新读取 key 并放入
+`X-Kary-Export-Root-Key` header；`Unmount` 不读取、不发送 key。`Health`
+不读取 token 或 key。
+
+只挂载 share root 以下目录的调用方应让 `ExportRootKeyFile` 保持为空。如需
+export root mount，应把与 wrapper `WRAPPER_EXPORT_ROOT_KEY_FILE` 相同内容的
+Secret 只读挂入 SDK 容器，并把文件路径传给 Config。不要把 key 放进环境变量、
+PV annotation、请求体或日志。wrapper 只在启动时读取 key；轮换 Secret 后需要
+重启 wrapper，SDK 则会在下一次 `Mount` 时重新读取文件。
+
+节点 state 不保存 key 原文，只保存 root 授权标志和 key 的 SHA-256
+fingerprint。轮换并重启 wrapper 后，已有 Linux mount 保持不变，但可信 caller
+需要用新 key 重复相同 `Mount` 来刷新 fingerprint；否则该容器后续重启时不会
+自动恢复旧 key 授权的 export root mount。wrapper 与客户端 Secret 更新期间若
+key 暂时不一致，root mount 会返回 `403`，调用方应在两端一致后重试。
+
+## 有效 NFS 路径与 export root
+
+有效路径由 PV CSI `volumeAttributes["subDir"]`（兼容 `subdir`）与
+`MountRequest.SourceSubPath` 共同决定：
+
+| PV `subDir` | `SourceSubPath` | 有效位置 | 需要 key |
+| --- | --- | --- | --- |
+| 空 | 空 | NFS `share` root | 是 |
+| 空 | `users/alice` | `share/users/alice` | 否 |
+| `tenants/team-a` | 空 | `share/tenants/team-a` | 否 |
+| `tenants/team-a` | `workspace` | `share/tenants/team-a/workspace` | 否 |
+
+PV `subDir` 归一化后为空、仅 `/` 或仅 `.` 都表示 share root；包含 NUL 或
+任意 `..` 路径段会被拒绝。`SourceSubPath` 空或归一化为 `.` 表示 PV root，
+绝对路径、NUL 和 `..` 会被拒绝。只有两者归一化后都为空才是 export root
+mount。SDK 无法在客户端得知 PV `subDir`，因此配置 key 文件后会在每次
+`Mount` 发送 header；wrapper 对非 root mount 忽略它。
 
 ## 版本兼容
 
@@ -116,8 +174,8 @@ SDK 会自动发送当前模块实现的 wrapper API 版本，调用方不能覆
 ## 完整示例
 
 下面的程序从 Downward API 环境变量读取 Pod identity，并使用
-`PV_NAME`、`TARGET_PATH`、可选的 `SOURCE_SUB_PATH` 和
-`CONTAINER_NAME` 执行 `health`、`mount` 或 `unmount`。
+`PV_NAME`、`TARGET_PATH`、可选的 `SOURCE_SUB_PATH`、`CONTAINER_NAME` 和
+`EXPORT_ROOT_KEY_FILE` 执行 `health`、`mount` 或 `unmount`。
 
 ```go
 package main
@@ -157,10 +215,11 @@ func run() error {
     }
 
     client, err := mounter.NewClient(mounter.Config{
-        DriverName:  envOr("DRIVER_NAME", "csi.nfs.zhida"),
-        SocketPath:  envOr("WRAPPER_SOCKET_PATH", "/var/lib/kruise-agents-nfs-csi/wrapper.sock"),
-        TokenFile:   envOr("PROJECTED_TOKEN_FILE", "/var/run/secrets/kruise-agents-nfs-csi/token"),
-        HTTPTimeout: 15 * time.Second,
+        DriverName:        envOr("DRIVER_NAME", "csi.nfs.zhida"),
+        SocketPath:        envOr("WRAPPER_SOCKET_PATH", "/var/lib/kruise-agents-nfs-csi/wrapper.sock"),
+        TokenFile:         envOr("PROJECTED_TOKEN_FILE", "/var/run/secrets/kruise-agents-nfs-csi/token"),
+        ExportRootKeyFile: os.Getenv("EXPORT_ROOT_KEY_FILE"),
+        HTTPTimeout:       15 * time.Second,
     })
     if err != nil {
         return fmt.Errorf("create mounter client: %w", err)
@@ -293,8 +352,10 @@ API 注入，不应手工伪造。
 ### Mount
 
 `Mount` 会把请求编码为 `POST /v1/mount`，并携带当前
-`TokenFile` 中的 bearer token。wrapper 成功完成实时校验和节点挂载后返回
-`MountResult`。
+`TokenFile` 中的 bearer token。配置 `ExportRootKeyFile` 时还会读取 key 并发送
+`X-Kary-Export-Root-Key` header。wrapper 成功完成 exact Pod token、实时
+Pod/PV、PV annotation、driver、目标容器、路径和必要的 export root key 校验，
+再完成节点挂载并返回 `MountResult`。PV 是否存在 PVC 或 `claimRef` 不参与授权。
 
 `SourceSubPath` 必须是 PV 内安全的相对目录路径。默认情况下它必须已存在；wrapper
 开启 `WRAPPER_CREATE_MISSING_SUBPATHS` 后可以逐级创建缺失目录，请求 mode 由
@@ -309,9 +370,13 @@ API 注入，不应手工伪造。
 
 ### Unmount
 
-`Unmount` 使用与 mount 相同的 TokenReview 和实时资源校验。wrapper 会先删除
-期望挂载状态，再卸载当前容器 namespace 中的目标，避免重协调重新创建已明确取消的
-挂载。目标已经不存在时，调用仍可幂等成功。
+`Unmount` 重新读取 token 并校验 exact Pod identity、实时 Pod/node 和目标容器，
+但不会读取或发送 export root key，也不重新读取 PV 或校验 PV annotation。
+wrapper 只会按 `(pod_uid, container_name, target_path)` 清理此前成功登记的
+mount state；state 的 PV 必须与请求一致。没有匹配 state 时幂等成功，不会卸载
+不受 wrapper 管理的 mount。state container ID 与实时容器不一致时只删除旧状态，
+不会操作新容器 namespace 的同路径 mount。完全匹配时先删除期望状态，再卸载
+当前容器 namespace 中的目标，避免重协调恢复已明确取消的挂载。
 
 ### Health
 
@@ -329,9 +394,10 @@ mount 验证。
 `NewClient` 返回本地配置错误；`Mount` 和 `Unmount` 还可能返回：
 
 - token 文件读取失败或内容为空；
+- export root mount 的 key 文件未配置、读取失败、内容为空或 key 不匹配；
 - wrapper socket 不存在、权限不足或连接失败；
 - context 取消或 HTTP 超时；
-- wrapper 返回的请求格式、TokenReview、Pod/PV/PVC、driver、container 或路径校验错误；
+- wrapper 返回的请求格式、TokenReview/exact Pod、Pod/PV annotation、driver、container 或路径校验错误；
 - 节点 mount/unmount 操作失败。
 
 wrapper 返回非 2xx 状态时，SDK 返回 `*mounter.ResponseError`。调用方可以通过
@@ -350,9 +416,11 @@ wrapper 返回非 2xx 状态时，SDK 返回 `*mounter.ResponseError`。调用�
 ## 与容器重启重协调的关系
 
 SDK 进程不运行 informer，也不保存 node mount 状态。首次 mount 成功后，节点
-wrapper 会把不含 token 和 NFS 凭据的期望挂载写入节点状态目录。目标业务容器获得
-新的 container ID 时，wrapper 重新检查实时 Pod、PV 和 PVC，并把挂载恢复到新的
-mount namespace。
+wrapper 会把不含 token、export root key 和 NFS 凭据的期望挂载写入节点状态目录；
+export root mount 保存“已通过 root 授权”的布尔值和 authorizing key 的 SHA-256
+fingerprint，不保存 key 原文。目标业务容器获得新的 container ID 时，wrapper
+重新检查实时 Pod、PV driver 和 annotation；只有已登记 root 授权且 fingerprint
+匹配当前 wrapper 启动 key 时，才恢复到新的 mount namespace。
 
 恢复是最终一致的。容器创建和 informer 处理完成之间，目标路径可能暂时未挂载。
 需要在应用第一条指令前保证挂载存在时，应由可信 runtime 增加启动门禁或重试。

@@ -2,6 +2,9 @@ apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: pv-sandbox-nfs-demo
+  annotations:
+    kary.dev/allow-namespace: openkruise-sandbox-demo
+    kary.dev/allow-serviceaccount: sandbox-mounter
 spec:
   capacity:
     storage: 100Gi

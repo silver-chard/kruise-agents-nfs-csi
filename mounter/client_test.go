@@ -403,6 +403,59 @@ func TestClientReadsTokenForEveryAuthenticatedRequest(t *testing.T) {
 	}
 }
 
+func TestClientReadsExportRootKeyForEveryMountOnly(t *testing.T) {
+	var mu sync.Mutex
+	var mountKeys []string
+	var unmountKey string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/mount", func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		mountKeys = append(mountKeys, request.Header.Get(api.ExportRootKeyHeader))
+		mu.Unlock()
+		writeResponse(t, w, http.StatusOK, api.Response{Data: MountResult{Mounted: true}})
+	})
+	mux.HandleFunc("/v1/unmount", func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		unmountKey = request.Header.Get(api.ExportRootKeyHeader)
+		mu.Unlock()
+		writeResponse(t, w, http.StatusOK, api.Response{Data: UnmountResult{Unmounted: true}})
+	})
+
+	client, _ := newTestClient(t, mux, time.Second)
+	keyFile := filepath.Join(t.TempDir(), "export-root-key")
+	if err := os.WriteFile(keyFile, []byte("root-key-one\n"), 0o600); err != nil {
+		t.Fatalf("write export root key: %v", err)
+	}
+	client.exportRootKeyFile = keyFile
+
+	if _, err := client.Mount(context.Background(), validMountRequest()); err != nil {
+		t.Fatalf("first Mount returned error: %v", err)
+	}
+	if err := os.WriteFile(keyFile, []byte("root-key-two\n"), 0o600); err != nil {
+		t.Fatalf("rotate export root key: %v", err)
+	}
+	if _, err := client.Mount(context.Background(), validMountRequest()); err != nil {
+		t.Fatalf("second Mount returned error: %v", err)
+	}
+	if _, err := client.Unmount(context.Background(), validUnmountRequest()); err != nil {
+		t.Fatalf("Unmount returned error: %v", err)
+	}
+
+	mu.Lock()
+	gotMountKeys := append([]string(nil), mountKeys...)
+	mu.Unlock()
+	wantMountKeys := []string{"root-key-one", "root-key-two"}
+	if !reflect.DeepEqual(gotMountKeys, wantMountKeys) {
+		t.Fatalf("mount export root keys = %#v, want %#v", gotMountKeys, wantMountKeys)
+	}
+	mu.Lock()
+	gotUnmountKey := unmountKey
+	mu.Unlock()
+	if gotUnmountKey != "" {
+		t.Fatalf("unmount export root key = %q, want empty", gotUnmountKey)
+	}
+}
+
 func TestClientSupportsConcurrentCalls(t *testing.T) {
 	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeResponse(t, w, http.StatusOK, api.Response{Data: HealthResult{

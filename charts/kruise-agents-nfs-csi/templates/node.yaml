@@ -122,6 +122,10 @@ spec:
               value: {{ .Values.wrapper.createMissingSubPaths | quote }}
             - name: WRAPPER_CREATED_SUBPATH_MODE
               value: {{ .Values.wrapper.createdSubPathMode | quote }}
+{{- if .Values.wrapper.exportRootKeySecret.name }}
+            - name: WRAPPER_EXPORT_ROOT_KEY_FILE
+              value: /var/run/secrets/kruise-agents-nfs-csi-export-root/key
+{{- end }}
             - name: NODE_ID
               valueFrom:
                 fieldRef:
@@ -145,6 +149,11 @@ spec:
             - name: wrapper-state
               mountPath: {{ .Values.paths.wrapperStateDir }}
               mountPropagation: Bidirectional
+{{- if .Values.wrapper.exportRootKeySecret.name }}
+            - name: export-root-key
+              mountPath: /var/run/secrets/kruise-agents-nfs-csi-export-root
+              readOnly: true
+{{- end }}
       volumes:
         - name: socket-dir
           hostPath:
@@ -162,3 +171,12 @@ spec:
           hostPath:
             path: {{ .Values.paths.wrapperStateDir }}
             type: DirectoryOrCreate
+{{- if .Values.wrapper.exportRootKeySecret.name }}
+        - name: export-root-key
+          secret:
+            secretName: {{ .Values.wrapper.exportRootKeySecret.name | quote }}
+            defaultMode: 0400
+            items:
+              - key: {{ .Values.wrapper.exportRootKeySecret.key | quote }}
+                path: key
+{{- end }}

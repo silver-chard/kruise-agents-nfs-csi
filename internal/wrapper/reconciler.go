@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/kube"
+	"github.com/silver-chard/kruise-agents-nfs-csi/internal/node"
 )
 
 var errDesiredMountStale = errors.New("desired mount is stale")
@@ -301,6 +302,14 @@ func (s *Server) reconcileMountForPod(ctx context.Context, snapshot desiredMount
 		return err
 	}
 	current.Request = request
+	if node.IsNFSExportRoot(plan) &&
+		(!current.ExportRootAuthorized || !s.exportRoot.authorizesFingerprint(current.ExportRootKeyFingerprint)) {
+		return fmt.Errorf("%w: desired mount has no authorization from the current NFS export root key", errDesiredMountStale)
+	}
+	if !node.IsNFSExportRoot(plan) {
+		current.ExportRootAuthorized = false
+		current.ExportRootKeyFingerprint = ""
+	}
 
 	if current.ContainerID == "" || current.ContainerID == plan.ContainerID {
 		mounted, err := s.mounter.IsMounted(ctx, plan)

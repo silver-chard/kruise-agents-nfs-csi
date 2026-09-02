@@ -25,6 +25,7 @@ func TestLoadWrapperConfigSubPathDefaults(t *testing.T) {
 func TestLoadWrapperConfigSubPathEnv(t *testing.T) {
 	t.Setenv("WRAPPER_CREATE_MISSING_SUBPATHS", "true")
 	t.Setenv("WRAPPER_CREATED_SUBPATH_MODE", "2770")
+	t.Setenv("WRAPPER_EXPORT_ROOT_KEY_FILE", "/run/secrets/export-root-key")
 
 	cfg, err := LoadWrapperConfig()
 	if err != nil {
@@ -36,6 +37,16 @@ func TestLoadWrapperConfigSubPathEnv(t *testing.T) {
 	wantMode := os.FileMode(0o770) | os.ModeSetgid
 	if cfg.CreatedSubPathMode != wantMode {
 		t.Fatalf("CreatedSubPathMode = %s, want 2770", FormatFileMode(cfg.CreatedSubPathMode))
+	}
+	if cfg.ExportRootKeyFile != "/run/secrets/export-root-key" {
+		t.Fatalf("ExportRootKeyFile = %q, want configured path", cfg.ExportRootKeyFile)
+	}
+}
+
+func TestLoadMounterConfigExportRootKeyFile(t *testing.T) {
+	t.Setenv("EXPORT_ROOT_KEY_FILE", "/run/secrets/export-root-key")
+	if got := LoadMounterConfig().ExportRootKeyFile; got != "/run/secrets/export-root-key" {
+		t.Fatalf("ExportRootKeyFile = %q, want configured path", got)
 	}
 }
 

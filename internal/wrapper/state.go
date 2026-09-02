@@ -14,11 +14,16 @@ import (
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 )
 
-const mountStateVersion = 1
+const (
+	legacyMountStateVersion = 1
+	mountStateVersion       = 2
+)
 
 type desiredMount struct {
-	Request     api.MountRequest `json:"request"`
-	ContainerID string           `json:"container_id,omitempty"`
+	Request                  api.MountRequest `json:"request"`
+	ContainerID              string           `json:"container_id,omitempty"`
+	ExportRootAuthorized     bool             `json:"export_root_authorized,omitempty"`
+	ExportRootKeyFingerprint string           `json:"export_root_key_fingerprint,omitempty"`
 }
 
 type desiredMountKey struct {
@@ -50,7 +55,9 @@ func desiredPodKeyFor(request api.MountRequest) desiredPodKey {
 }
 
 func sameMountIntent(left, right desiredMount) bool {
-	return left.Request == right.Request
+	return left.Request == right.Request &&
+		left.ExportRootAuthorized == right.ExportRootAuthorized &&
+		left.ExportRootKeyFingerprint == right.ExportRootKeyFingerprint
 }
 
 type mountStateStore interface {
@@ -102,7 +109,7 @@ func newFileMountStateStore(dir string) (*fileMountStateStore, error) {
 		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, fmt.Errorf("decode mount state %s: %w", path, err)
 		}
-		if state.Version != mountStateVersion {
+		if state.Version != legacyMountStateVersion && state.Version != mountStateVersion {
 			return nil, fmt.Errorf("mount state %s has unsupported version %d", path, state.Version)
 		}
 		key := state.Mount.key()

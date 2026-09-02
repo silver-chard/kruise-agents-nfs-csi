@@ -22,7 +22,6 @@ type Kubernetes interface {
 	GetPod(ctx context.Context, namespace, name string) (*kube.Pod, error)
 	RunPodInformer(ctx context.Context, nodeName string, synced func([]kube.Pod), handle func(kube.PodWatchEvent)) error
 	GetPersistentVolume(ctx context.Context, name string) (*kube.PersistentVolume, error)
-	GetPersistentVolumeClaim(ctx context.Context, namespace, name string) (*kube.PersistentVolumeClaimResource, error)
 }
 
 type Server struct {
@@ -35,6 +34,7 @@ type Server struct {
 	targetLocks     [targetLockStripes]sync.Mutex
 	reconcileErrors sync.Map
 	retrying        sync.Map
+	exportRoot      exportRootAuthorizer
 }
 
 const targetLockStripes = 128
@@ -46,22 +46,27 @@ func NewServer(cfg config.WrapperConfig, kubeClient Kubernetes, mounter node.Mou
 	if err != nil {
 		return nil, err
 	}
-	return newServerWithState(cfg, kubeClient, mounter, state, logger), nil
+	return newServerWithState(cfg, kubeClient, mounter, state, logger)
 }
 
-func newServerWithState(cfg config.WrapperConfig, kubeClient Kubernetes, mounter node.Mounter, state mountStateStore, logger *log.Logger) *Server {
+func newServerWithState(cfg config.WrapperConfig, kubeClient Kubernetes, mounter node.Mounter, state mountStateStore, logger *log.Logger) (*Server, error) {
+	exportRoot, err := loadExportRootAuthorizer(cfg.ExportRootKeyFile)
+	if err != nil {
+		return nil, err
+	}
 	server := &Server{
-		cfg:     cfg,
-		kube:    kubeClient,
-		mounter: mounter,
-		state:   state,
-		logger:  logger,
-		mux:     http.NewServeMux(),
+		cfg:        cfg,
+		kube:       kubeClient,
+		mounter:    mounter,
+		state:      state,
+		logger:     logger,
+		mux:        http.NewServeMux(),
+		exportRoot: exportRoot,
 	}
 	server.mux.HandleFunc("/healthz", server.handleHealthz)
 	server.mux.HandleFunc("/v1/mount", server.handleMount)
 	server.mux.HandleFunc("/v1/unmount", server.handleUnmount)
-	return server
+	return server, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +104,7 @@ func (s *Server) handleMount(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
 	defer cancel()
 
-	result, err := s.mount(ctx, token, request)
+	result, err := s.mount(ctx, token, r.Header.Get(api.ExportRootKeyHeader), request)
 	if err != nil {
 		writeError(w, requestErrorStatus(err), err.Error())
 		return
@@ -138,8 +143,12 @@ func (s *Server) handleUnmount(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, result)
 }
 
-func (s *Server) mount(ctx context.Context, token string, request api.MountRequest) (*api.MountResult, error) {
+func (s *Server) mount(ctx context.Context, token, exportRootKey string, request api.MountRequest) (*api.MountResult, error) {
 	request, plan, err := s.authorizedMountPlan(ctx, token, request, true)
+	if err != nil {
+		return nil, err
+	}
+	exportRootKeyFingerprint, err := s.exportRoot.authorize(plan, exportRootKey)
 	if err != nil {
 		return nil, err
 	}
@@ -149,13 +158,34 @@ func (s *Server) mount(ctx context.Context, token string, request api.MountReque
 	defer lock.Unlock()
 
 	previous, existed := s.state.Get(key)
-	desired := desiredMount{Request: request}
+	desired := desiredMount{
+		Request:                  request,
+		ExportRootAuthorized:     exportRootKeyFingerprint != "",
+		ExportRootKeyFingerprint: exportRootKeyFingerprint,
+	}
+	if existed && previous.Request == desired.Request && previous.ExportRootAuthorized != desired.ExportRootAuthorized {
+		return nil, fmt.Errorf("%w: effective NFS export-root policy changed; unmount the existing target first", errBadRequest)
+	}
+	if existed && previous.Request == desired.Request &&
+		previous.ExportRootAuthorized && desired.ExportRootAuthorized &&
+		previous.ExportRootKeyFingerprint != desired.ExportRootKeyFingerprint {
+		previous.ExportRootKeyFingerprint = desired.ExportRootKeyFingerprint
+		if err := s.state.Put(previous); err != nil {
+			return nil, fmt.Errorf("persist refreshed export-root authorization: %w", err)
+		}
+	}
 	if existed && sameMountIntent(previous, desired) && (previous.ContainerID == "" || previous.ContainerID == plan.ContainerID) {
 		mounted, err := s.mounter.IsMounted(ctx, plan)
 		if err != nil {
 			return nil, errors.Join(errNodeOperation, err)
 		}
 		if mounted {
+			if previous.ContainerID != plan.ContainerID {
+				previous.ContainerID = plan.ContainerID
+				if err := s.state.Put(previous); err != nil {
+					return nil, fmt.Errorf("persist mounted container identity: %w", err)
+				}
+			}
 			return mountResult(s.cfg.DriverName, request), nil
 		}
 	}
@@ -197,18 +227,56 @@ func (s *Server) unmount(ctx context.Context, token string, request api.UnmountR
 		TargetPath:    request.TargetPath,
 		ContainerName: request.ContainerName,
 	}
-	mountRequest, plan, err := s.authorizedMountPlan(ctx, token, mountRequest, false)
+	mountRequest, err := s.normalizeMountRequest(mountRequest, false)
 	if err != nil {
 		return nil, err
 	}
+	pod, err := s.authorizedPodForRequest(ctx, token, mountRequest)
+	if err != nil {
+		return nil, err
+	}
+	containerStatus, err := selectContainerStatus(pod, mountRequest.ContainerName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errBadRequest, err)
+	}
+	mountRequest.ContainerName = containerStatus.Name
 	key := desiredMountKeyFor(mountRequest)
 	lock := s.targetLock(key)
 	lock.Lock()
 	defer lock.Unlock()
 
 	previous, existed := s.state.Get(key)
-	if existed && previous.Request.PVName != mountRequest.PVName {
+	if !existed {
+		return &api.UnmountResult{
+			Unmounted:     true,
+			DriverName:    s.cfg.DriverName,
+			PVName:        mountRequest.PVName,
+			TargetPath:    mountRequest.TargetPath,
+			ContainerName: mountRequest.ContainerName,
+		}, nil
+	}
+	if previous.Request.PVName != mountRequest.PVName {
 		return nil, fmt.Errorf("%w: target path %s is registered for pv %s", errBadRequest, mountRequest.TargetPath, previous.Request.PVName)
+	}
+	if previous.ContainerID == "" || previous.ContainerID != containerStatus.ContainerID {
+		if err := s.state.Delete(key); err != nil {
+			return nil, fmt.Errorf("delete stale desired mount: %w", err)
+		}
+		s.logger.Printf("removed stale desired mount for pv %s pod %s/%s container %s at %s without touching container %s", mountRequest.PVName, mountRequest.Namespace, mountRequest.PodName, mountRequest.ContainerName, mountRequest.TargetPath, safeContainerID(containerStatus.ContainerID))
+		return &api.UnmountResult{
+			Unmounted:     true,
+			DriverName:    s.cfg.DriverName,
+			PVName:        mountRequest.PVName,
+			TargetPath:    mountRequest.TargetPath,
+			ContainerName: mountRequest.ContainerName,
+		}, nil
+	}
+	plan := node.MountPlan{
+		PV:            node.PersistentVolume{Name: mountRequest.PVName},
+		PodUID:        pod.Metadata.UID,
+		ContainerName: containerStatus.Name,
+		ContainerID:   containerStatus.ContainerID,
+		TargetPath:    mountRequest.TargetPath,
 	}
 	if err := s.state.Delete(key); err != nil {
 		return nil, fmt.Errorf("delete desired mount: %w", err)
@@ -263,14 +331,32 @@ func (s *Server) authorizedMountPlan(ctx context.Context, token string, request 
 		return request, node.MountPlan{}, err
 	}
 
-	tokenStatus, err := s.kube.ReviewToken(ctx, token, []string{s.cfg.TokenAudience})
+	pod, err := s.authorizedPodForRequest(ctx, token, request)
 	if err != nil {
-		return request, node.MountPlan{}, fmt.Errorf("token review failed: %w", err)
-	}
-	if err := authorizeToken(tokenStatus, request.Namespace, s.cfg.TokenAudience); err != nil {
 		return request, node.MountPlan{}, err
 	}
-	return s.mountPlanForRequest(ctx, request, tokenStatus)
+	return s.mountPlanForPod(ctx, request, pod)
+}
+
+func (s *Server) authorizedPodForRequest(ctx context.Context, token string, request api.MountRequest) (*kube.Pod, error) {
+	tokenStatus, err := s.kube.ReviewToken(ctx, token, []string{s.cfg.TokenAudience})
+	if err != nil {
+		return nil, fmt.Errorf("token review failed: %w", err)
+	}
+	if err := authorizeToken(tokenStatus, request.Namespace, s.cfg.TokenAudience); err != nil {
+		return nil, err
+	}
+	pod, err := s.kube.GetPod(ctx, request.Namespace, request.PodName)
+	if err != nil {
+		return nil, fmt.Errorf("get pod %s/%s: %w", request.Namespace, request.PodName, err)
+	}
+	if err := authorizePod(tokenStatus, pod, request); err != nil {
+		return nil, err
+	}
+	if err := validatePodNode(pod, s.cfg.NodeName); err != nil {
+		return nil, err
+	}
+	return pod, nil
 }
 
 func (s *Server) normalizeMountRequest(request api.MountRequest, validateSubPath bool) (api.MountRequest, error) {
@@ -295,43 +381,12 @@ func (s *Server) normalizeMountRequest(request api.MountRequest, validateSubPath
 	return request, nil
 }
 
-func (s *Server) mountPlanForRequest(ctx context.Context, request api.MountRequest, tokenStatus *kube.TokenReviewStatus) (api.MountRequest, node.MountPlan, error) {
-	pod, err := s.kube.GetPod(ctx, request.Namespace, request.PodName)
-	if err != nil {
-		if tokenStatus == nil && kube.IsNotFound(err) {
-			return request, node.MountPlan{}, fmt.Errorf("%w: pod %s/%s no longer exists", errDesiredMountStale, request.Namespace, request.PodName)
-		}
-		return request, node.MountPlan{}, fmt.Errorf("get pod %s/%s: %w", request.Namespace, request.PodName, err)
-	}
-	if tokenStatus == nil {
-		if err := validatePodIdentity(pod, request); err != nil {
-			return request, node.MountPlan{}, fmt.Errorf("%w: %v", errDesiredMountStale, err)
-		}
-	} else {
-		if err := authorizePod(tokenStatus, pod, request); err != nil {
-			return request, node.MountPlan{}, err
-		}
-	}
-	if err := validatePodNode(pod, s.cfg.NodeName); err != nil {
-		return request, node.MountPlan{}, err
-	}
-	return s.mountPlanForPod(ctx, request, pod)
-}
-
 func (s *Server) mountPlanForPod(ctx context.Context, request api.MountRequest, pod *kube.Pod) (api.MountRequest, node.MountPlan, error) {
 	pv, err := s.kube.GetPersistentVolume(ctx, request.PVName)
 	if err != nil {
 		return request, node.MountPlan{}, fmt.Errorf("get pv %s: %w", request.PVName, err)
 	}
-	if err := validatePVClaimRefForPod(pod, pv); err != nil {
-		return request, node.MountPlan{}, err
-	}
-	pvc, err := s.kube.GetPersistentVolumeClaim(ctx, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name)
-	if err != nil {
-		return request, node.MountPlan{}, fmt.Errorf("get pvc %s/%s for pv %s: %w", pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, pv.Metadata.Name, err)
-	}
-
-	if err := authorizePVForPod(s.cfg.DriverName, pod, pv, pvc); err != nil {
+	if err := authorizePVForPod(s.cfg.DriverName, pod, pv); err != nil {
 		return request, node.MountPlan{}, err
 	}
 

@@ -40,25 +40,121 @@ For every mount request the wrapper:
 1. requires the configured `driver_name`;
 2. validates the bearer token with Kubernetes TokenReview and the configured
    audience;
-3. fetches the live Pod and checks namespace, name, UID, and service account;
-4. fetches the PV and checks `spec.csi.driver`;
-5. checks that the PV claimRef belongs to the requesting Pod namespace;
-6. fetches the live PVC referenced by the PV claimRef and checks name,
-   namespace, and UID when present;
-7. validates the target path denylist;
-8. refuses to continue when the target path is already a mount point.
+3. requires the TokenReview identity to be the live Pod's service account and
+   requires the token's bound Pod name and UID to match the request exactly;
+4. fetches the live Pod and checks namespace, name, UID, node, phase, and target
+   container;
+5. fetches the PV and checks `spec.csi.driver`;
+6. evaluates the PV's namespace and service account annotation allowlists;
+7. validates the NFS source, request subpath, and target path denylist;
+8. requires an additional capability key if the effective source is the NFS
+   export root; and
+9. refuses to continue when the target path is already a mount point.
 
 The request body does not contain NFS server credentials. NFS mount source data
 is derived from the Kubernetes PV object on the wrapper side. Workload
-containers should not be able to read PV/PVC objects through Kubernetes RBAC,
-and the mounter should receive mount configuration from the sandbox runtime CSI
-invocation instead of accepting arbitrary PV/PVC choices from the workload.
-The wrapper does not read higher-level claim objects. PVC identity is always
-derived from the live PV `claimRef`.
+containers should not be able to read PV objects through Kubernetes RBAC, and
+the mounter should receive mount configuration from the sandbox runtime CSI
+invocation instead of accepting arbitrary PV choices from the workload.
+
+The wrapper does not fetch a PVC and does not use the PV's `spec.claimRef` as
+an authorization boundary. This is intentional so one PV can be shared across
+namespaces, but it also means a bound PV is not protected by its claim
+namespace. Per-PV access is provided only by the annotation policy described
+below, in addition to the socket, exact-Pod token, driver, node, container, and
+path checks.
 
 For the dynamic path, the sandbox runtime invokes the mounter with a CSI
 `NodePublishVolumeRequest`. The workload container does not receive the wrapper
 socket or projected wrapper token.
+
+## Exact Pod-Bound Token
+
+The configured audience prevents a token intended for another recipient, such
+as the Kubernetes API server, from being replayed to the wrapper. Audience is
+not storage authorization by itself. The wrapper additionally requires
+TokenReview to return exactly one non-empty
+`authentication.kubernetes.io/pod-name` and
+`authentication.kubernetes.io/pod-uid` value, and both values must match the
+requested and live target Pod. The token username must also match that Pod's
+namespace and service account.
+
+This prevents one Pod from using a token belonging to another Pod that happens
+to use the same service account. A legacy or otherwise unbound service account
+token that does not expose the bound Pod name and UID is rejected.
+
+## PV Annotation Policy
+
+The wrapper recognizes two PV annotations:
+
+```yaml
+kary.dev/allow-namespace: "sandbox-a, sandbox-b"
+kary.dev/allow-serviceaccount: "runtime, workspace-agent"
+```
+
+Each annotation is an independent comma-separated allowlist. Entries are
+trimmed and compared exactly and case-sensitively with the live Pod namespace
+or bare `spec.serviceAccountName`. When both annotations are present, both must
+match. A missing annotation makes only that dimension unrestricted; if both are
+missing, the PV policy itself is unrestricted.
+
+An explicitly empty value, an empty item such as `a,,b` or `a,`, and `*` are
+invalid and cause authorization to fail. There is deliberately no wildcard;
+operators express an unrestricted dimension by omitting its annotation.
+
+Because missing annotations default to unrestricted and `claimRef` is ignored,
+every existing PV without these annotations becomes selectable across
+namespaces by any caller that passes the other wrapper checks. Kubernetes RBAC
+for creating or patching PVs and these annotations is therefore part of the
+storage security boundary.
+
+Annotation changes apply to future mounts. They do not actively revoke or
+unmount a mount that already exists in an unchanged container namespace. If the
+container ID changes, reconciliation reloads the live PV and applies the current
+annotation policy before restoring the mount. Explicit unmount uses exact-Pod
+authentication and a matching saved desired-mount record, but intentionally
+does not re-evaluate current PV annotations, so revocation cannot prevent
+cleanup.
+
+## NFS Export-Root Capability
+
+`source_sub_path` is relative to the PV root, while the PV CSI `subDir` is
+relative to the configured NFS share. The wrapper treats a request as an NFS
+export-root mount only when both values normalize to empty:
+
+| PV CSI `subDir` | Request `source_sub_path` | Effective source | Key required |
+| --- | --- | --- | --- |
+| empty | empty | NFS export root | yes |
+| empty | non-empty | request directory below export root | no |
+| non-empty | empty | PV root below the export | no |
+| non-empty | non-empty | request directory below the PV root | no |
+
+This is a lexical policy over the trusted PV CSI fields. It cannot detect an
+NFS-server-side symlink or alias whose non-empty `subDir` resolves back to the
+export root. Treat control of PV `server`/`share`/`subDir` and the NFS namespace
+as storage-administrator authority; the capability key is not a defense against
+a malicious PV or NFS administrator.
+
+The wrapper reads the capability from `WRAPPER_EXPORT_ROOT_KEY_FILE` or
+`--export-root-key-file` at startup. The trimmed value must contain 32 through
+4096 visible ASCII characters and should be generated randomly. The authorizer
+retains only its SHA-256 hash in memory for constant-time comparison; the
+plaintext is not added to mount state.
+If the option is absent, export-root mounting is disabled. Changing the file
+requires restarting the wrapper because it is a startup credential.
+
+An authorized mounter uses `EXPORT_ROOT_KEY_FILE` or
+`--export-root-key-file`; the Go SDK uses `Config.ExportRootKeyFile`. The client
+reads the file for each mount and places the value only in the
+`X-Kary-Export-Root-Key` HTTP header over the Unix socket. The key is neither a
+JSON request field nor an unmount credential, and clients must not log it.
+
+For Helm deployments, `wrapper.exportRootKeySecret.name` and
+`wrapper.exportRootKeySecret.key` select an existing Secret in the release
+namespace. The chart mounts that key read-only into the wrapper with mode
+`0400`; it does not create or distribute the Secret to mounter clients. Only
+clients explicitly trusted to mount the NFS export root should receive the same
+Secret.
 
 ## Source SubPath Creation
 
@@ -68,8 +164,8 @@ missing directory components below the staged PV. It is disabled by default, so
 upgrading does not add NFS write behavior unless an operator enables it.
 
 The switch is global to a wrapper process. Every caller that passes the
-existing Pod, namespace, PV, and PVC checks can create any valid relative path
-inside that PV. v0.0.2 does not enforce an allowed subpath prefix or a separate
+existing Pod and PV annotation checks can create any valid relative path inside
+that PV. v0.0.2 does not enforce an allowed subpath prefix or a separate
 "may create" permission, and a misspelled path can leave a persistent empty
 directory. Only trusted runtimes or sidecars should receive both the wrapper
 socket and projected token.
@@ -94,19 +190,51 @@ umask, default ACL, owner, or group configuration.
 
 After the initial authenticated mount succeeds, the wrapper stores only the
 normalized Pod/PV/container/target mount intent and the mounted container ID in
-its node-local state directory. Each desired mount has its own `0600` file, so
-updates do not rewrite every Pod's state. It does not persist the projected bearer token, NFS
-credentials, or a caller-supplied NFS server.
+its node-local state directory. State format v2 also stores the boolean
+`export_root_authorized` and the SHA-256 fingerprint of the authorizing key.
+Reconciliation permits a previously authorized export-root mount only while
+that fingerprint matches the wrapper's current startup key. Each
+desired mount has its own `0600` file, so updates do not rewrite every Pod's
+state. It does not persist the projected bearer token, export-root key, NFS
+credentials, or a caller-supplied NFS server. Legacy state v1 loads with root
+authorization set to false and therefore cannot silently authorize a new
+export-root mount during reconciliation.
+
+This upgrade is intentionally fail closed in the reverse direction: a legacy
+wrapper that only understands state v1 rejects v2 files instead of ignoring the
+new authorization metadata. Before rolling back to such a wrapper, drain or
+explicitly unmount dynamic mounts and plan the node-state migration; do not
+silently discard live desired-mount state.
+
+Rotating the key does not actively unmount an existing Linux mount. After the
+wrapper restarts with the new key, a trusted caller can repeat the same mount
+request with that key to refresh the saved fingerprint without stacking a new
+mount. Until then, a later container restart will not automatically restore the
+old-key export-root intent. Wrapper and client Secret updates must be
+coordinated because the wrapper reads only at startup while clients read before
+each mount.
 
 The wrapper runs one `SharedIndexInformer` filtered by its own node name. The
 informer owns LIST/WATCH cache synchronization, resource-version handling, and
 reconnection; the wrapper does not issue periodic GET requests for every saved
 Pod. When an informer event reports a different container ID for the same Pod
-UID and container name, the wrapper validates the live Pod, PV, PV claimRef, and
-PVC again before mounting into the replacement container namespace. A deleted,
-terminal, UID-mismatched, or different-node Pod makes the saved intent stale and
-removes it. Explicit authenticated unmount removes the intent before unmounting
-so the reconciler cannot recreate it.
+UID and container name, the wrapper validates the live Pod, PV, driver, and PV
+annotation policy again before mounting into the replacement container
+namespace. An export-root plan is restored only when the saved v2 state records
+the original root authorization and its key fingerprint matches the current
+wrapper key. A deleted, terminal, UID-mismatched, or
+different-node Pod makes the saved intent stale and removes it.
+
+Explicit unmount first requires exact-Pod authentication and a saved intent
+whose Pod UID, container, target, and PV match. It does not fetch the PV or
+re-evaluate annotations, so a later annotation revocation cannot block cleanup.
+The saved container ID must also match the live target container. If the
+container has changed, the wrapper removes only the stale intent and does not
+touch a same-path mount in the replacement namespace.
+The wrapper deletes the intent before unmounting and restores it if the node
+operation fails, preventing the reconciler from recreating a successfully
+removed mount. If no matching intent exists, unmount is idempotently successful
+and does not touch an unrelated mount point.
 
 Reconciliation is event-driven but still eventually consistent. The target path
 is absent between container creation and handling its Pod status event, so

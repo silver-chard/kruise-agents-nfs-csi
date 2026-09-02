@@ -21,10 +21,10 @@ import (
 )
 
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
-	podREST rest.Interface
+	baseURL   string
+	tokenFile string
+	http      *http.Client
+	podREST   rest.Interface
 }
 
 type APIError struct {
@@ -51,9 +51,8 @@ func NewInClusterClient(tokenFile, caFile string, timeout time.Duration) (*Clien
 		return nil, fmt.Errorf("KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be set")
 	}
 
-	tokenBytes, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return nil, fmt.Errorf("read kubernetes token file: %w", err)
+	if _, err := readBearerTokenFile(tokenFile); err != nil {
+		return nil, err
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -79,10 +78,10 @@ func NewInClusterClient(tokenFile, caFile string, timeout time.Duration) (*Clien
 	}
 
 	return &Client{
-		baseURL: "https://" + netJoinHostPort(host, port),
-		token:   strings.TrimSpace(string(tokenBytes)),
-		http:    &http.Client{Transport: transport, Timeout: timeout},
-		podREST: coreClient.RESTClient(),
+		baseURL:   "https://" + netJoinHostPort(host, port),
+		tokenFile: tokenFile,
+		http:      &http.Client{Transport: transport, Timeout: timeout},
+		podREST:   coreClient.RESTClient(),
 	}, nil
 }
 
@@ -120,15 +119,6 @@ func (c *Client) GetPersistentVolume(ctx context.Context, name string) (*Persist
 	return &pv, nil
 }
 
-func (c *Client) GetPersistentVolumeClaim(ctx context.Context, namespace, name string) (*PersistentVolumeClaimResource, error) {
-	var pvc PersistentVolumeClaimResource
-	resourcePath := path.Join("/api/v1/namespaces", namespace, "persistentvolumeclaims", name)
-	if err := c.do(ctx, http.MethodGet, resourcePath, nil, &pvc); err != nil {
-		return nil, err
-	}
-	return &pvc, nil
-}
-
 func (c *Client) do(ctx context.Context, method, resourcePath string, in, out any) error {
 	var body io.Reader
 	if in != nil {
@@ -148,7 +138,11 @@ func (c *Client) do(ctx context.Context, method, resourcePath string, in, out an
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	token, err := readBearerTokenFile(c.tokenFile)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -175,6 +169,18 @@ func (c *Client) do(ctx context.Context, method, resourcePath string, in, out an
 		return fmt.Errorf("decode kubernetes response %s %s: %w", method, resourcePath, err)
 	}
 	return nil
+}
+
+func readBearerTokenFile(tokenFile string) (string, error) {
+	tokenBytes, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("read kubernetes token file: %w", err)
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+	if token == "" {
+		return "", fmt.Errorf("kubernetes token file is empty")
+	}
+	return token, nil
 }
 
 func netJoinHostPort(host, port string) string {

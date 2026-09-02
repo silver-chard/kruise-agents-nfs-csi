@@ -2,11 +2,14 @@ package wrapper
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,8 +89,140 @@ func TestReconcileMountDoesNotStackMountInCurrentContainer(t *testing.T) {
 	}
 }
 
-func TestUnmountDeletesDesiredMountAndPreventsReconcile(t *testing.T) {
+func TestMountExportRootRequiresKeyAndPersistsAuthorization(t *testing.T) {
 	server, store, _, mounter := newReconcileTestServer(t)
+	request := testMountRequest()
+	request.SourceSubPath = ""
+
+	if _, err := server.mount(context.Background(), "valid-token", "", request); err == nil {
+		t.Fatal("mount export root without key succeeded")
+	}
+	if len(mounter.mountCalls) != 0 {
+		t.Fatalf("mount calls after rejected root mount = %d, want 0", len(mounter.mountCalls))
+	}
+
+	key := "0123456789abcdef0123456789abcdef"
+	keyFile := filepath.Join(t.TempDir(), "export-root-key")
+	if err := os.WriteFile(keyFile, []byte(key), 0o600); err != nil {
+		t.Fatalf("write export root key: %v", err)
+	}
+	authorizer, err := loadExportRootAuthorizer(keyFile)
+	if err != nil {
+		t.Fatalf("load export root key: %v", err)
+	}
+	server.exportRoot = authorizer
+
+	result, err := server.mount(context.Background(), "valid-token", key, request)
+	if err != nil {
+		t.Fatalf("mount export root with key: %v", err)
+	}
+	if !result.Mounted || len(mounter.mountCalls) != 1 {
+		t.Fatalf("mount result=%#v calls=%d, want successful mount", result, len(mounter.mountCalls))
+	}
+	normalizedRequest := request
+	normalizedRequest.ContainerName = "main"
+	stored, exists := store.Get(desiredMountKeyFor(normalizedRequest))
+	if !exists || !stored.ExportRootAuthorized || stored.ExportRootKeyFingerprint == "" {
+		t.Fatalf("stored root authorization = %#v, want authorized state", stored)
+	}
+	if stored.ExportRootKeyFingerprint != authorizer.fingerprint {
+		t.Fatalf("stored fingerprint = %q, want current authorizer fingerprint", stored.ExportRootKeyFingerprint)
+	}
+	data, err := os.ReadFile(filepath.Join(store.dir, mountStateFilename(desiredMountKeyFor(normalizedRequest))))
+	if err != nil {
+		t.Fatalf("read stored root mount: %v", err)
+	}
+	if strings.Contains(string(data), key) {
+		t.Fatal("mount state contains the export root key")
+	}
+}
+
+func TestReconcileExportRootRequiresPersistedAuthorization(t *testing.T) {
+	tests := []struct {
+		name        string
+		authorized  bool
+		fingerprint string
+		wantStale   bool
+	}{
+		{name: "missing authorization", wantStale: true},
+		{name: "missing fingerprint", authorized: true, wantStale: true},
+		{name: "old fingerprint", authorized: true, fingerprint: strings.Repeat("f", 64), wantStale: true},
+		{name: "current fingerprint", authorized: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, store, kubeClient, mounter := newReconcileTestServer(t)
+			key := "0123456789abcdef0123456789abcdef"
+			server.exportRoot = testExportRootAuthorizer(t, key)
+			fingerprint := test.fingerprint
+			if test.authorized && fingerprint == "" && !test.wantStale {
+				fingerprint = server.exportRoot.fingerprint
+			}
+			desired := desiredMount{
+				Request:                  testMountRequest(),
+				ContainerID:              "containerd://old-container",
+				ExportRootAuthorized:     test.authorized,
+				ExportRootKeyFingerprint: fingerprint,
+			}
+			desired.Request.SourceSubPath = ""
+			if err := store.Put(desired); err != nil {
+				t.Fatalf("put desired mount: %v", err)
+			}
+			kubeClient.pod.Status.ContainerStatuses[0].ContainerID = "containerd://new-container"
+
+			err := server.reconcileMount(context.Background(), desired)
+			if test.wantStale {
+				if !errors.Is(err, errDesiredMountStale) {
+					t.Fatalf("reconcile error = %v, want stale root authorization error", err)
+				}
+				if len(mounter.mountCalls) != 0 {
+					t.Fatalf("mount calls = %d, want 0", len(mounter.mountCalls))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("reconcileMount returned error: %v", err)
+			}
+			if len(mounter.mountCalls) != 1 {
+				t.Fatalf("mount calls = %d, want 1", len(mounter.mountCalls))
+			}
+		})
+	}
+}
+
+func TestMountRefreshesExportRootFingerprintWithoutRemount(t *testing.T) {
+	server, store, _, mounter := newReconcileTestServer(t)
+	request := testMountRequest()
+	request.SourceSubPath = ""
+
+	oldKey := "0123456789abcdef0123456789abcdef"
+	server.exportRoot = testExportRootAuthorizer(t, oldKey)
+	if _, err := server.mount(context.Background(), "valid-token", oldKey, request); err != nil {
+		t.Fatalf("initial export-root mount: %v", err)
+	}
+
+	newKey := "fedcba9876543210fedcba9876543210"
+	server.exportRoot = testExportRootAuthorizer(t, newKey)
+	if _, err := server.mount(context.Background(), "valid-token", newKey, request); err != nil {
+		t.Fatalf("refresh export-root authorization: %v", err)
+	}
+	if len(mounter.mountCalls) != 1 {
+		t.Fatalf("mount calls = %d, want one initial mount", len(mounter.mountCalls))
+	}
+
+	normalized := request
+	normalized.ContainerName = "main"
+	stored, exists := store.Get(desiredMountKeyFor(normalized))
+	if !exists {
+		t.Fatal("desired mount disappeared after key refresh")
+	}
+	if stored.ExportRootKeyFingerprint != server.exportRoot.fingerprint {
+		t.Fatalf("stored fingerprint = %q, want current fingerprint", stored.ExportRootKeyFingerprint)
+	}
+}
+
+func TestUnmountDeletesDesiredMountAndPreventsReconcile(t *testing.T) {
+	server, store, kubeClient, mounter := newReconcileTestServer(t)
 	desired := desiredMount{
 		Request:     testMountRequest(),
 		ContainerID: "containerd://old-container",
@@ -96,6 +231,7 @@ func TestUnmountDeletesDesiredMountAndPreventsReconcile(t *testing.T) {
 		t.Fatalf("put desired mount: %v", err)
 	}
 	mounter.mounted[mounterKey(desired.ContainerID, desired.Request.TargetPath)] = true
+	kubeClient.pv.Metadata.Annotations = map[string]string{allowNamespaceAnnotation: "revoked-ns"}
 
 	request := api.UnmountRequest{
 		APIVersion:    desired.Request.APIVersion,
@@ -120,6 +256,71 @@ func TestUnmountDeletesDesiredMountAndPreventsReconcile(t *testing.T) {
 	server.reconcileAll(context.Background())
 	if len(mounter.mountCalls) != 0 {
 		t.Fatalf("mount calls after explicit unmount = %d, want 0", len(mounter.mountCalls))
+	}
+}
+
+func TestUnmountWithoutDesiredStateDoesNotUnmountUnknownMount(t *testing.T) {
+	server, _, _, mounter := newReconcileTestServer(t)
+	request := testMountRequest()
+	mounter.mounted[mounterKey("containerd://old-container", request.TargetPath)] = true
+
+	result, err := server.unmount(context.Background(), "valid-token", api.UnmountRequest{
+		APIVersion:    request.APIVersion,
+		DriverName:    request.DriverName,
+		Namespace:     request.Namespace,
+		PodName:       request.PodName,
+		PodUID:        request.PodUID,
+		PVName:        request.PVName,
+		TargetPath:    request.TargetPath,
+		ContainerName: request.ContainerName,
+	})
+	if err != nil {
+		t.Fatalf("unmount returned error: %v", err)
+	}
+	if !result.Unmounted {
+		t.Fatal("Unmounted = false, want idempotent success")
+	}
+	if len(mounter.unmountCalls) != 0 {
+		t.Fatalf("unmount calls = %d, want 0", len(mounter.unmountCalls))
+	}
+}
+
+func TestUnmountStaleContainerStateDoesNotTouchNewContainerMount(t *testing.T) {
+	server, store, kubeClient, mounter := newReconcileTestServer(t)
+	desired := desiredMount{
+		Request:     testMountRequest(),
+		ContainerID: "containerd://old-container",
+	}
+	if err := store.Put(desired); err != nil {
+		t.Fatalf("put desired mount: %v", err)
+	}
+	kubeClient.pod.Status.ContainerStatuses[0].ContainerID = "containerd://new-container"
+	mounter.mounted[mounterKey("containerd://new-container", desired.Request.TargetPath)] = true
+
+	result, err := server.unmount(context.Background(), "valid-token", api.UnmountRequest{
+		APIVersion:    desired.Request.APIVersion,
+		DriverName:    desired.Request.DriverName,
+		Namespace:     desired.Request.Namespace,
+		PodName:       desired.Request.PodName,
+		PodUID:        desired.Request.PodUID,
+		PVName:        desired.Request.PVName,
+		TargetPath:    desired.Request.TargetPath,
+		ContainerName: desired.Request.ContainerName,
+	})
+	if err != nil {
+		t.Fatalf("unmount stale state: %v", err)
+	}
+	if !result.Unmounted {
+		t.Fatal("Unmounted = false, want idempotent success")
+	}
+	if len(mounter.unmountCalls) != 0 {
+		t.Fatalf("unmount calls = %d, want 0", len(mounter.unmountCalls))
+	}
+	if !mounter.mounted[mounterKey("containerd://new-container", desired.Request.TargetPath)] {
+		t.Fatal("new container mount was removed")
+	}
+	if _, exists := store.Get(desired.key()); exists {
+		t.Fatal("stale desired mount still exists")
 	}
 }
 
@@ -162,6 +363,57 @@ func TestFileMountStateStoreReloadsDesiredMount(t *testing.T) {
 	if got != desired {
 		t.Fatalf("reloaded desired mount = %#v, want %#v", got, desired)
 	}
+	data, err := os.ReadFile(filepath.Join(dir, mountStateFilename(desired.key())))
+	if err != nil {
+		t.Fatalf("read current mount state: %v", err)
+	}
+	var state mountStateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("decode current mount state: %v", err)
+	}
+	if state.Version != mountStateVersion {
+		t.Fatalf("mount state version = %d, want %d", state.Version, mountStateVersion)
+	}
+}
+
+func TestFileMountStateStoreLoadsLegacyStateWithoutRootAuthorization(t *testing.T) {
+	dir := t.TempDir()
+	desired := desiredMount{Request: testMountRequest(), ContainerID: "containerd://container-a"}
+	payload, err := json.Marshal(mountStateFile{Version: legacyMountStateVersion, Mount: desired})
+	if err != nil {
+		t.Fatalf("encode legacy mount state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, mountStateFilename(desired.key())), payload, 0o600); err != nil {
+		t.Fatalf("write legacy mount state: %v", err)
+	}
+
+	store, err := newFileMountStateStore(dir)
+	if err != nil {
+		t.Fatalf("load legacy mount state: %v", err)
+	}
+	got, exists := store.Get(desired.key())
+	if !exists {
+		t.Fatal("legacy desired mount was not loaded")
+	}
+	if got.ExportRootAuthorized {
+		t.Fatal("legacy desired mount unexpectedly has export root authorization")
+	}
+	if got.ExportRootKeyFingerprint != "" {
+		t.Fatal("legacy desired mount unexpectedly has an export root key fingerprint")
+	}
+}
+
+func testExportRootAuthorizer(t *testing.T, key string) exportRootAuthorizer {
+	t.Helper()
+	keyFile := filepath.Join(t.TempDir(), "export-root-key")
+	if err := os.WriteFile(keyFile, []byte(key), 0o600); err != nil {
+		t.Fatalf("write export root key: %v", err)
+	}
+	authorizer, err := loadExportRootAuthorizer(keyFile)
+	if err != nil {
+		t.Fatalf("load export root key: %v", err)
+	}
+	return authorizer
 }
 
 func TestFileMountStateStoreUsesOneProtectedFilePerMountAndPodIndex(t *testing.T) {
@@ -231,6 +483,10 @@ func newReconcileTestServer(t *testing.T) (*Server, *fileMountStateStore, *recon
 			Audiences:     []string{"test-audience"},
 			User: kube.TokenReviewUser{
 				Username: "system:serviceaccount:sandbox-ns:sandbox-sa",
+				Extra: map[string][]string{
+					tokenPodNameExtraKey: {request.PodName},
+					tokenPodUIDExtraKey:  {request.PodUID},
+				},
 			},
 		},
 		pod: &kube.Pod{
@@ -263,21 +519,21 @@ func newReconcileTestServer(t *testing.T) (*Server, *fileMountStateStore, *recon
 				},
 			},
 		},
-		pvc: &kube.PersistentVolumeClaimResource{
-			Metadata: kube.ObjectMeta{Name: "pvc-a", Namespace: request.Namespace, UID: "pvc-uid"},
-		},
 	}
 	mounter := &reconcileTestMounter{mounted: make(map[string]bool)}
 	store, err := newFileMountStateStore(filepath.Join(t.TempDir(), "mount-state"))
 	if err != nil {
 		t.Fatalf("newFileMountStateStore: %v", err)
 	}
-	server := newServerWithState(config.WrapperConfig{
+	server, err := newServerWithState(config.WrapperConfig{
 		DriverName:     request.DriverName,
 		TokenAudience:  "test-audience",
 		RequestTimeout: time.Second,
 		NodeName:       "node-a",
 	}, kubeClient, mounter, store, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("newServerWithState: %v", err)
+	}
 	return server, store, kubeClient, mounter
 }
 
@@ -300,7 +556,6 @@ type reconcileTestKube struct {
 	pod         *kube.Pod
 	podErr      error
 	pv          *kube.PersistentVolume
-	pvc         *kube.PersistentVolumeClaimResource
 }
 
 func (k *reconcileTestKube) ReviewToken(context.Context, string, []string) (*kube.TokenReviewStatus, error) {
@@ -322,10 +577,6 @@ func (k *reconcileTestKube) RunPodInformer(ctx context.Context, _ string, synced
 
 func (k *reconcileTestKube) GetPersistentVolume(context.Context, string) (*kube.PersistentVolume, error) {
 	return k.pv, nil
-}
-
-func (k *reconcileTestKube) GetPersistentVolumeClaim(context.Context, string, string) (*kube.PersistentVolumeClaimResource, error) {
-	return k.pvc, nil
 }
 
 type reconcileTestMounter struct {

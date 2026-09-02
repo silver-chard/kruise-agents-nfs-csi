@@ -1,6 +1,9 @@
 package api
 
-const Version = "kruise-agents-nfs-csi.zhida/v1alpha1"
+const (
+	Version             = "kruise-agents-nfs-csi.zhida/v1alpha1"
+	ExportRootKeyHeader = "X-Kary-Export-Root-Key"
+)
 
 type MountRequest struct {
 	APIVersion    string `json:"api_version"`

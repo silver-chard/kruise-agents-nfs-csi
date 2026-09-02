@@ -8,20 +8,21 @@ import (
 )
 
 const (
-	DefaultDriverName    = "csi.nfs.zhida"
-	DefaultTokenAudience = "kruise-agents-nfs-csi.zhida/sandbox-mounter"
-	DefaultSocketPath    = "/var/lib/kruise-agents-nfs-csi/wrapper.sock"
-	DefaultTokenFile     = "/var/run/secrets/kruise-agents-nfs-csi/token"
-	DefaultNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-	DefaultPodInfoDir    = "/var/run/secrets/kruise-agents-nfs-csi"
-	DefaultPodNameFile   = DefaultPodInfoDir + "/pod_name"
-	DefaultPodUIDFile    = DefaultPodInfoDir + "/pod_uid"
-	DefaultPodNSFile     = DefaultPodInfoDir + "/namespace"
-	DefaultKubeTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-	DefaultKubeCAFile    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	DefaultStagingRoot   = "/var/lib/kruise-agents-nfs-csi/staging"
-	DefaultMountStateDir = "/var/lib/kruise-agents-nfs-csi/mounts"
-	DefaultHostProcRoot  = "/proc"
+	DefaultDriverName        = "csi.nfs.zhida"
+	DefaultTokenAudience     = "kruise-agents-nfs-csi.zhida/sandbox-mounter"
+	DefaultSocketPath        = "/var/lib/kruise-agents-nfs-csi/wrapper.sock"
+	DefaultTokenFile         = "/var/run/secrets/kruise-agents-nfs-csi/token"
+	DefaultNamespaceFile     = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	DefaultPodInfoDir        = "/var/run/secrets/kruise-agents-nfs-csi"
+	DefaultPodNameFile       = DefaultPodInfoDir + "/pod_name"
+	DefaultPodUIDFile        = DefaultPodInfoDir + "/pod_uid"
+	DefaultPodNSFile         = DefaultPodInfoDir + "/namespace"
+	DefaultKubeTokenFile     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	DefaultKubeCAFile        = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	DefaultStagingRoot       = "/var/lib/kruise-agents-nfs-csi/staging"
+	DefaultMountStateDir     = "/var/lib/kruise-agents-nfs-csi/mounts"
+	DefaultHostProcRoot      = "/proc"
+	DefaultExportRootKeyFile = ""
 
 	DefaultCreatedSubPathMode os.FileMode = 0o770
 )
@@ -42,17 +43,19 @@ type WrapperConfig struct {
 	UnstageAfterMount     bool
 	CreateMissingSubPaths bool
 	CreatedSubPathMode    os.FileMode
+	ExportRootKeyFile     string
 }
 
 type MounterConfig struct {
-	DriverName    string
-	SocketPath    string
-	TokenFile     string
-	TokenAudience string
-	NamespaceFile string
-	PodNameFile   string
-	PodUIDFile    string
-	HTTPTimeout   time.Duration
+	DriverName        string
+	SocketPath        string
+	TokenFile         string
+	TokenAudience     string
+	NamespaceFile     string
+	PodNameFile       string
+	PodUIDFile        string
+	HTTPTimeout       time.Duration
+	ExportRootKeyFile string
 }
 
 func LoadWrapperConfig() (WrapperConfig, error) {
@@ -80,19 +83,21 @@ func LoadWrapperConfig() (WrapperConfig, error) {
 		),
 		CreateMissingSubPaths: BoolEnv("WRAPPER_CREATE_MISSING_SUBPATHS", false),
 		CreatedSubPathMode:    createdSubPathMode,
+		ExportRootKeyFile:     Env("WRAPPER_EXPORT_ROOT_KEY_FILE", DefaultExportRootKeyFile),
 	}, nil
 }
 
 func LoadMounterConfig() MounterConfig {
 	return MounterConfig{
-		DriverName:    Env("DRIVER_NAME", DefaultDriverName),
-		SocketPath:    Env("WRAPPER_SOCKET_PATH", DefaultSocketPath),
-		TokenFile:     Env("PROJECTED_TOKEN_FILE", DefaultTokenFile),
-		TokenAudience: Env("TOKEN_AUDIENCE", DefaultTokenAudience),
-		NamespaceFile: Env("NAMESPACE_FILE", DefaultNamespaceFile),
-		PodNameFile:   Env("POD_NAME_FILE", DefaultPodNameFile),
-		PodUIDFile:    Env("POD_UID_FILE", DefaultPodUIDFile),
-		HTTPTimeout:   DurationEnv("MOUNTER_HTTP_TIMEOUT", 15*time.Second),
+		DriverName:        Env("DRIVER_NAME", DefaultDriverName),
+		SocketPath:        Env("WRAPPER_SOCKET_PATH", DefaultSocketPath),
+		TokenFile:         Env("PROJECTED_TOKEN_FILE", DefaultTokenFile),
+		TokenAudience:     Env("TOKEN_AUDIENCE", DefaultTokenAudience),
+		NamespaceFile:     Env("NAMESPACE_FILE", DefaultNamespaceFile),
+		PodNameFile:       Env("POD_NAME_FILE", DefaultPodNameFile),
+		PodUIDFile:        Env("POD_UID_FILE", DefaultPodUIDFile),
+		HTTPTimeout:       DurationEnv("MOUNTER_HTTP_TIMEOUT", 15*time.Second),
+		ExportRootKeyFile: Env("EXPORT_ROOT_KEY_FILE", DefaultExportRootKeyFile),
 	}
 }
 

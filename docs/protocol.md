@@ -29,7 +29,19 @@ Authentication header:
 Authorization: Bearer <projected-service-account-token>
 ```
 
-Unmount uses the same identity and authorization model:
+The projected token must be bound to the exact target Pod name and UID. A
+client that is allowed to mount the NFS export root can additionally send:
+
+```text
+X-Kary-Export-Root-Key: <export-root-capability-key>
+```
+
+The capability key is an optional HTTP header, not a JSON field. It is ignored
+for effective NFS subpaths and required only when both the PV CSI `subDir` and
+the request `source_sub_path` normalize to empty. Clients must not log it.
+
+Unmount uses the same exact-Pod identity model, but does not send or require the
+export-root key:
 
 ```text
 kruise-nfs-mounter unmount --driver csi.nfs.zhida --config <base64 NodePublishVolumeRequest>
@@ -107,7 +119,9 @@ Success:
 }
 ```
 
-Unmount removes the saved desired mount before touching the target namespace.
-If the target is already absent (for example, while a replacement container is
-starting), the operation still succeeds and prevents reconciliation from
-recreating the mount.
+Unmount only acts on a matching saved desired mount. It removes that state
+before touching the target namespace. The saved and live container IDs must
+match; after a container change, unmount removes only the stale state and does
+not touch a same-path mount in the replacement namespace. If the desired mount
+or target is already absent, the operation still succeeds without unmounting an
+unrelated mount point. PV annotation changes do not block this cleanup path.

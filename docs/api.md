@@ -20,30 +20,41 @@ runtime 或 mounter sidecar，不应该直接暴露给不可信业务容器。
 
 所有请求和响应 JSON 字段都使用 `snake_case`。
 
-## v0.0.2 wrapper 启动配置
+## Wrapper 启动配置
 
-v0.0.2 新增缺失 SourceSubPath 的可选创建策略。这个策略属于 wrapper
-部署配置，不是单次 mount 请求字段：
+缺失 SourceSubPath 创建策略和 NFS export root key 都属于 wrapper
+部署配置，不是 mount JSON 请求字段：
 
 | 环境变量 | Wrapper flag | Helm value | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `WRAPPER_CREATE_MISSING_SUBPATHS` | `--create-missing-subpaths` | `wrapper.createMissingSubPaths` | `false` | 是否逐级创建缺失的 `source_sub_path`。默认关闭，保持原有“目录必须已存在”的行为。 |
 | `WRAPPER_CREATED_SUBPATH_MODE` | `--created-subpath-mode` | `wrapper.createdSubPathMode` | `0770` | 新建每一级目录传给 `mkdirat` 的八进制 mode。实际 mode 仍受进程 umask 和文件系统/NFS default ACL 影响。 |
+| `WRAPPER_EXPORT_ROOT_KEY_FILE` | `--export-root-key-file` | `wrapper.exportRootKeySecret.name` / `key` | 空 | wrapper 侧 NFS export root capability key 文件。不配置时拒绝所有 export root mount，但不影响有效路径位于 root 之下的 mount。 |
 
 mode 必须是 `0001` 到 `07777` 范围内的八进制权限字符串；`0000` 或非法值会
 导致 wrapper 启动失败。wrapper 不会为新建或已有目录执行 `chown`，也不会修改
 已有目录的 mode。
+
+export root key 去掉首尾空白后必须是 32 到 4096 个可见 ASCII
+字符（不含空格）。wrapper 启动时读取并保存其 SHA-256 摘要；替换
+文件后需要重启 wrapper 才能生效。不要把 key 写进 PV annotation、
+mount JSON、日志或节点持久化 mount state。
 
 ## 调用链路
 
 1. 可信 runtime 选择调用 `kruise-nfs-mounter`，或在 Go 进程中调用 `mounter.Client`。
 2. 调用方从参数、环境变量或 Downward API projected 文件取得 Pod 身份；SDK
    调用方把 namespace、Pod name 和 Pod UID 填入请求。
-3. 命令或 SDK 从配置的 token 文件读取 projected service account token。
+3. 命令或 SDK 从配置的 token 文件读取专用 audience 的、绑定当前
+   Pod 的 projected service account token。
 4. 命令或 SDK 通过节点 wrapper Unix socket 发送 `POST /v1/mount`。
-5. wrapper 校验 token、实时 Pod、PV、PVC、目标容器、driver name 和目标路径。
+5. wrapper 通过 TokenReview 校验 audience、ServiceAccount 和 token 绑定的精确
+   Pod name/UID，再校验实时 Pod、PV annotation、目标容器、driver name
+   和目标路径。
 6. wrapper 在节点上临时 stage NFS PV，并把整个 PV 或 PV 内指定目录 bind-mount 到目标容器的 mount namespace。
-7. wrapper 在节点持久化不含 token 的期望挂载；同一 Pod UID 的目标容器 ID 变化后，重新校验实时 Pod/PV/PVC 并挂入新的 mount namespace。
+7. wrapper 在节点持久化不含 token、export root key 或 NFS 凭据的期望
+   挂载；同一 Pod UID 的目标容器 ID 变化后，重新校验实时
+   Pod、PV driver 和 annotation，再挂入新的 mount namespace。
 
 业务容器不应该拿到 wrapper socket、projected wrapper token，或可任意选择 PV 的配置。
 
@@ -92,6 +103,7 @@ kruise-nfs-mounter mount \
 | `--pod-uid` | 否 | `POD_UID` 或 `POD_UID_FILE` | 请求 Pod UID。 |
 | `--socket-path` | 否 | `WRAPPER_SOCKET_PATH` 或 `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | wrapper Unix socket 路径。 |
 | `--token-file` | 否 | `PROJECTED_TOKEN_FILE` 或 `/var/run/secrets/kruise-agents-nfs-csi/token` | projected service account token 文件。 |
+| `--export-root-key-file` | 否 | `EXPORT_ROOT_KEY_FILE` 或空 | NFS export root capability key 文件。只有有效 NFS 路径是 export root 时才需要。 |
 
 成功时 stdout：
 
@@ -133,7 +145,8 @@ kruise-nfs-mounter mount \
 ```
 
 只建议在可信 sidecar 或受控排障会话中使用。调用环境仍然需要 wrapper socket 和
-projected token。
+专用 audience 的 Pod-bound projected token。如果该 PV 的有效 NFS 路径是
+export root，还需通过 `--export-root-key-file` 提供 key；非 root 挂载不需要。
 
 ## Go SDK
 
@@ -160,6 +173,7 @@ func (*Client) CloseIdleConnections()
 | `DriverName` | `string` | 请求使用的 CSI driver name，必须与 wrapper 和 PV 一致。 |
 | `SocketPath` | `string` | 当前容器内可见的 wrapper Unix socket。 |
 | `TokenFile` | `string` | projected service account token 文件。SDK 在每次 mount/unmount 时重新读取，以兼容 token 轮换。 |
+| `ExportRootKeyFile` | `string` | 可选 NFS export root capability key 文件。配置后 SDK 仅在 `Mount` 时重新读取并放入 HTTP header；`Unmount` 不读取、不发送。 |
 | `HTTPTimeout` | `time.Duration` | UDS HTTP 请求超时；为 `0` 时使用 15 秒默认值。 |
 | `DisableHTTPTimeout` | `bool` | 显式关闭 client 级请求超时；通常不应启用，并应为每次调用传入有界 context。 |
 
@@ -173,8 +187,12 @@ SDK 只是现有 mounter 的进程内客户端封装：
 - 不访问 CSI socket 或 host `/proc`；
 - 不需要 privileged 或 `SYS_ADMIN`；
 - 仍然需要 wrapper socket、projected token 和 Downward API Pod identity；
-- 所有 mount/unmount 仍由 wrapper 执行 TokenReview，并重新检查实时
-  Pod、PV、PVC、目标容器、driver 和目标路径；
+- 所有 mount/unmount 仍由 wrapper 执行 TokenReview，严格匹配 token 绑定的
+  Pod name/UID 与实时 Pod；
+- mount 还会检查实时 PV、PV annotation、目标容器、driver、路径和
+  export root key（仅 root 挂载）；
+- unmount 不发送 export root key，也不重新核验 PV annotation，只会清理
+  该精确 Pod/container/target 已登记的 mount state 和对应 mount；
 - 成功挂载仍由节点 wrapper 持久化期望状态并负责容器重启后的重协调。
 
 不要为了使用 SDK 把 wrapper socket 和 projected token 交给不可信业务代码。
@@ -216,7 +234,13 @@ SDK 会自动使用当前模块的 wrapper API 版本，wrapper 会严格校验�
 Content-Type: application/json
 Accept: application/json
 Authorization: Bearer <projected-service-account-token>
+X-Kary-Export-Root-Key: <export-root-key>
 ```
+
+`X-Kary-Export-Root-Key` 仅 export root mount 需要，不是 JSON 字段。
+有效 NFS 路径在 export root 之下时
+应省略它；mounter/SDK 配置了 key 文件时可能仍会发送该 header，
+wrapper 会对非 root mount 忽略它。
 
 请求体：
 
@@ -240,9 +264,9 @@ Authorization: Bearer <projected-service-account-token>
 | --- | --- | --- |
 | `api_version` | 是 | 必须是 `kruise-agents-nfs-csi.zhida/v1alpha1`。 |
 | `driver_name` | 是 | 必须匹配 wrapper `DRIVER_NAME` 和 `pv.spec.csi.driver`。 |
-| `namespace` | 是 | 请求 Pod namespace。token service account 和 PV claimRef 都必须属于该 namespace。 |
-| `pod_name` | 是 | 请求 Pod name。 |
-| `pod_uid` | 是 | 请求 Pod UID，用于防止 Pod name 复用导致误授权。 |
+| `namespace` | 是 | 请求 Pod namespace。必须与 token ServiceAccount namespace、实时 Pod 和 token Pod-bound identity 一致。 |
+| `pod_name` | 是 | 请求 Pod name，必须同时匹配实时 Pod 和 TokenReview 返回的 bound Pod name。 |
+| `pod_uid` | 是 | 请求 Pod UID，必须同时匹配实时 Pod 和 TokenReview 返回的 bound Pod UID。 |
 | `pv_name` | 是 | 要挂载的 PersistentVolume。wrapper 从实时 PV 对象读取 NFS source 信息。 |
 | `source_sub_path` | 否 | PV 内目录 subPath。为空时挂整个 PV；不为空时必须是相对目录路径，且不能包含 `..`、绝对路径或 symlink 组件。目录默认必须存在；是否创建缺失目录由 wrapper 全局策略决定。 |
 | `target_path` | 是 | 目标业务容器内的绝对路径。wrapper 会用 `path.Clean` 归一化并拒绝敏感路径。 |
@@ -280,7 +304,7 @@ Authorization: Bearer <projected-service-account-token>
 | `200` | mount 请求已完成。 |
 | `400` | JSON 非法、缺少必填字段、`api_version` 不匹配、`driver_name` 不匹配、source subPath/目标路径非法、缺失 subPath 且创建策略关闭，或目标容器选择非法。 |
 | `401` | 缺少 bearer token、Authorization 格式错误，或 token 为空。 |
-| `403` | Token、Pod、PV、PVC、driver、namespace 或 claimRef 鉴权/实时资源校验失败。 |
+| `403` | Token/audience/bound Pod、PV driver/annotation 或 export root key 鉴权失败。 |
 | `405` | HTTP method 不支持。 |
 | `500` | 鉴权通过后节点 mount/unmount 操作失败，包括自动创建目录时的 `EACCES`、`EROFS`、`ENOSPC` 或 `EDQUOT` 等存储错误。 |
 | `503` | `WRAPPER_ENABLE_MOUNT=false`，节点 mount 操作被禁用。 |
@@ -298,8 +322,31 @@ curl --unix-socket /var/lib/kruise-agents-nfs-csi/wrapper.sock \
 unset token
 ```
 
+上例挂载了非空 `source_sub_path`，因此不需要 export root key。调试
+export root mount 时必须额外从文件读取 key 并发送
+`X-Kary-Export-Root-Key` header。不要把 key 写入 shell history、请求文件或
+日志；正常集成优先使用 CLI 的 `--export-root-key-file` 或 SDK
+`ExportRootKeyFile`。
+
 不要把真实 token 打印到日志或写进文档。正常用户集成优先使用
 `kruise-nfs-mounter` 命令封装。
+
+### POST /v1/unmount
+
+unmount 请求只发送 `Authorization: Bearer <projected-service-account-token>`，
+不发送 `X-Kary-Export-Root-Key`。wrapper 会再次校验专用 audience、token
+绑定的精确 Pod、实时 Pod/node 和目标容器，然后按
+`(pod_uid, container_name, target_path)` 查找持久化 state：
+
+- 没有已登记 state 时幂等返回成功，不卸载未受 wrapper 管理的 mount；
+- state 的 PV 必须与请求 `pv_name` 一致；
+- state 的 container ID 必须与实时目标容器一致；若容器已经换代，只删除旧
+  state，不触碰新容器 namespace 中的同路径 mount；
+- 完全匹配时先删除 state，再卸载当前容器 namespace 中的目标；
+- 不重新获取 PV，不重新校验 PV annotation，也不需要 export root key。
+
+这个收敛式语义保证管理员收紧 PV annotation 或轮换 export root key 后，
+原 Pod 仍能清理之前成功登记的挂载。
 
 ## 鉴权与校验
 
@@ -309,16 +356,74 @@ wrapper 只有在下面检查全部通过时才会执行 mount：
 | --- | --- |
 | TokenReview | bearer token 必须通过 Kubernetes TokenReview，并包含配置的 `TOKEN_AUDIENCE`。 |
 | Namespace | token service account 必须属于请求的 namespace。 |
-| Pod 身份 | 实时 Pod namespace、name、UID 和 service account 必须匹配请求与 token。 |
+| Exact Pod token | TokenReview `status.user.extra` 必须各返回且只返回一个 `authentication.kubernetes.io/pod-name` 和 `authentication.kubernetes.io/pod-uid`，并与请求和实时 Pod 精确匹配。未绑定 Pod 的 ServiceAccount token 会被拒绝。 |
+| Pod 身份 | 实时 Pod namespace、name、UID 和 service account 必须匹配请求与 token，且 Pod 必须在当前 wrapper 节点。 |
 | Pod phase | `Succeeded` 和 `Failed` Pod 会被拒绝。 |
 | PV driver | `pv.spec.csi.driver` 必须匹配 `driver_name`。 |
-| PV claimRef | PV 必须有 claimRef，且 claimRef namespace 必须是请求 Pod namespace。 |
-| PVC 身份 | wrapper 会读取 PV claimRef 指向的实时 PVC，并校验 namespace、name 和存在时的 UID。 |
+| PV namespace allowlist | PV 存在 `kary.dev/allow-namespace` 时，实时 Pod namespace 必须在逗号分隔的 allowlist 中；annotation 缺失时该维度不限制。 |
+| PV ServiceAccount allowlist | PV 存在 `kary.dev/allow-serviceaccount` 时，实时 Pod `spec.serviceAccountName` 必须在 allowlist 中；annotation 缺失时该维度不限制。 |
 | Container | 目标容器必须出现在 Pod status 中，并且 container ID 不能为空。 |
 | NFS source | PV CSI `volumeAttributes` 必须包含 `server` 和 `share`；`subDir` 可选。 |
+| Export root | 归一化后的 PV `subDir` 和请求 `source_sub_path` 都为空时，必须提供与 wrapper 配置一致的 export root key。节点 state 保存授权标志和 key fingerprint；容器重启时必须仍匹配 wrapper 当前 key。 |
 | Source subPath | `source_sub_path` 为空时挂整个 PV；不为空时必须是安全的相对目录。默认必须已存在，只有 wrapper 显式开启创建策略后才会创建缺失目录。 |
 | Target path | 目标路径必须是绝对路径，且不能指向敏感系统路径或 secret 路径。 |
 | Existing mount | 如果目标路径已经是 mount point，wrapper 返回错误，不会主动 unmount。 |
+
+### PV annotation 授权
+
+PV 不需要 PVC 或 `claimRef` 才能被 wrapper 挂载。wrapper 不使用 PV
+`claimRef` 或 PVC 作为 mount 授权；无论 PV 是否已绑定，都只按实时
+Pod identity、PV driver 和下面两个可选 annotation 决定访问：
+
+```yaml
+metadata:
+  annotations:
+    kary.dev/allow-namespace: "team-a, team-b"
+    kary.dev/allow-serviceaccount: "runtime-a, runtime-b"
+```
+
+- annotation key 完全缺失表示该维度 unrestricted；两个 key 都缺失时，
+  任何能通过 exact Pod token、socket、driver 和路径检查的 Pod 都可请求该 PV。
+- key 存在时，值是逗号分隔的精确 allowlist；每项会执行
+  `TrimSpace`，匹配区分大小写。
+- 空值、空项（包括开头/结尾逗号或连续逗号）和 `*` 都是非法
+  配置并 fail closed；如果需要 unrestricted，应删除该 key。
+- 两个 key 都存在时使用 AND：namespace 和 ServiceAccount name 必须
+  同时命中。ServiceAccount annotation 只写 name，namespace 由另一维度限制。
+
+因此，不要把“不写 annotation”理解为默认隔离。它表示对所有能同时
+拿到 wrapper socket 和当前 Pod 专用 token 的可信 caller 开放该 PV。
+
+## 有效 NFS 路径与 export root
+
+wrapper 使用 PV CSI `volumeAttributes["subDir"]`（兼容小写
+`subdir`）和请求 `source_sub_path` 一起判定有效 NFS 路径。这里的
+export root 是 PV `server` + `share` 指定的 NFS share root，不是节点或
+NFS server 的文件系统 `/`。
+
+| 归一化 PV `subDir` | 归一化 `source_sub_path` | 有效位置 | 需要 export root key |
+| --- | --- | --- | --- |
+| 空 | 空 | `share` root | 是 |
+| 空 | `users/alice` | `share/users/alice` | 否 |
+| `tenants/team-a` | 空 | `share/tenants/team-a` | 否 |
+| `tenants/team-a` | `workspace` | `share/tenants/team-a/workspace` | 否 |
+
+PV `subDir` 会去掉首尾空白并归一化；空、仅 `/` 或仅 `.` 的路径
+都表示 share root，包含 NUL 或任何 `..` 路径段会被拒绝。
+`source_sub_path` 空或归一化为 `.` 时表示 PV root；绝对路径、NUL 和
+`..` 会被拒绝。只要两者任一归一化后非空，有效路径就在
+export root 之下，不需要 key。
+
+wrapper 没有配置 `WRAPPER_EXPORT_ROOT_KEY_FILE` 时默认拒绝 export root
+mount。有效 key 由 mount client 通过 `X-Kary-Export-Root-Key` header
+提供；节点 state 只保存“该 mount 已通过 root 授权”的布尔值和 key 的 SHA-256
+fingerprint，不保存 key 原文、header、token 或可重放凭据。旧 state v1 没有
+这些授权信息，因此不会在容器重启后把历史 root mount 自动恢复为已授权。
+
+wrapper 只在启动时读取 key，而 SDK/mounter 每次 mount 都读取客户端 key 文件。
+轮换后必须重启 wrapper 并协调两端 Secret。已有 Linux mount 不会被主动卸载；
+可信 caller 可用新 key 重复相同 mount 请求来刷新 state fingerprint。未刷新时，
+该容器后续重启不会自动恢复旧 key 授权的 export root mount。
 
 ## Source SubPath 规则
 
@@ -331,7 +436,9 @@ wrapper 只有在下面检查全部通过时才会执行 mount：
 - 任意已有路径组件是 symlink；
 - 任意已有路径组件不是目录。
 
-空值表示挂载整个 PV。当前只支持目录 subPath，不支持文件 subPath。默认配置
+空值表示挂载整个 PV；如果 PV `subDir` 也归一化为空，这是
+export root mount，还必须通过 root key 鉴权。当前只支持目录 subPath，
+不支持文件 subPath。默认配置
 `WRAPPER_CREATE_MISSING_SUBPATHS=false` 下，任意组件不存在也会被拒绝。
 
 启用 `WRAPPER_CREATE_MISSING_SUBPATHS=true` 后，wrapper 使用逐级、禁止跟随 symlink
@@ -367,26 +474,35 @@ mounter sidecar 或 SDK 调用方需要：
   `github.com/silver-chard/kruise-agents-nfs-csi/mounter`；
 - `DRIVER_NAME`，并且与已安装 driver 和 PV 匹配；
 - 从节点 wrapper state 目录挂载的 `WRAPPER_SOCKET_PATH`；
-- audience 匹配 `TOKEN_AUDIENCE` 的 `PROJECTED_TOKEN_FILE`；
+- audience 匹配 `TOKEN_AUDIENCE`、且由当前 Pod 的
+  `serviceAccountToken` projected volume 签发的 `PROJECTED_TOKEN_FILE`；TokenReview
+  必须能返回与当前 Pod 一致的 bound Pod name/UID extra；
 - 来自 Downward API 环境变量或 projected 文件的 Pod namespace、name 和 UID；
+- 只在需要 export root mount 时挂载与 wrapper 配置一致的 key 文件，
+  并为 CLI 设置 `EXPORT_ROOT_KEY_FILE` / `--export-root-key-file`，或为 SDK
+  设置 `Config.ExportRootKeyFile`；
 - 非 privileged，且不需要 `SYS_ADMIN`。
 
 wrapper DaemonSet 需要：
 
 - 相同的 `DRIVER_NAME`；
 - 相同的 `TOKEN_AUDIENCE`；
+- 如需允许 export root mount，使用 `WRAPPER_EXPORT_ROOT_KEY_FILE` /
+  `--export-root-key-file` 或 Helm `wrapper.exportRootKeySecret` 挂载 key；不配置则
+  fail closed，但非 root mount 照常工作；
 - host 上的 wrapper state 目录和 kubelet pod 目录；
 - `WRAPPER_MOUNT_STATE_DIR` 必须持久化到节点，并且只允许 wrapper 写入；
 - 如需自动创建缺失 subPath，显式设置
   `WRAPPER_CREATE_MISSING_SUBPATHS=true`，并确认
   `WRAPPER_CREATED_SUBPATH_MODE`、进程 umask 和 NFS export 权限；
 - Linux 节点 mount 能力；
-- 用于 TokenReview、Pod、PV、PVC 读取的 Kubernetes RBAC。
+- 用于 TokenReview、Pod 和 PV 读取的 Kubernetes RBAC。
 
 目标 workload 需要：
 
 - Pod service account 与 mounter projected token 对应；
-- PV 已绑定到同 namespace 的 PVC；
+- PV 的可选 `kary.dev/allow-namespace` 和
+  `kary.dev/allow-serviceaccount` 允许该 Pod；PV 不需要 PVC 或 `claimRef`；
 - 目标路径是绝对路径且当前不是 mount point；
 - 单容器 Pod、`SANDBOX_MAIN_CONTAINER=true` 标记，或显式传入 `container_name` 三者至少满足一个。
 
@@ -406,6 +522,9 @@ wrapper 环境变量：
 | `WRAPPER_ENABLE_MOUNT` | `true` | 设置为 `false` 时只验证 API 链路，不做真实 mount。 |
 | `WRAPPER_UNSTAGE_AFTER_MOUNT` | `true` | 每次成功 bind mount 后，卸载并删除该 PV 的 staging source。 |
 | `WRAPPER_REQUEST_TIMEOUT` | `30s` | Kubernetes 与 mount 操作的单请求超时。 |
+| `WRAPPER_CREATE_MISSING_SUBPATHS` | `false` | 是否逐级创建缺失的 `source_sub_path`。 |
+| `WRAPPER_CREATED_SUBPATH_MODE` | `0770` | 创建缺失 subPath 时请求的八进制 mode。 |
+| `WRAPPER_EXPORT_ROOT_KEY_FILE` | 空 | wrapper 侧 export root key 文件。空值表示拒绝所有 export root mount。 |
 
 mounter 环境变量：
 
@@ -414,6 +533,7 @@ mounter 环境变量：
 | `DRIVER_NAME` | `csi.nfs.zhida` | 请求中发送的 driver name。 |
 | `WRAPPER_SOCKET_PATH` | `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | wrapper UDS 路径。 |
 | `PROJECTED_TOKEN_FILE` | `/var/run/secrets/kruise-agents-nfs-csi/token` | projected service account token。 |
+| `EXPORT_ROOT_KEY_FILE` | 空 | 可选 export root key 文件；不需要 root mount 的 caller 应保持为空。 |
 | `POD_NAMESPACE` | 空 | Pod namespace。 |
 | `POD_NAME` | 空 | Pod name。 |
 | `POD_UID` | 空 | Pod UID。 |
@@ -421,5 +541,6 @@ mounter 环境变量：
 | `MOUNTER_HTTP_TIMEOUT` | `15s` | wrapper HTTP client 超时。 |
 
 Go SDK 不隐式读取上述 mounter 环境配置。调用方通过 `mounter.Config` 设置
-`DriverName`、`SocketPath`、`TokenFile` 和 `HTTPTimeout`，并把从
+`DriverName`、`SocketPath`、`TokenFile`、可选 `ExportRootKeyFile` 和
+`HTTPTimeout`，并把从
 Downward API 获得的 Pod namespace、name 和 UID 填入每个 mount/unmount 请求。

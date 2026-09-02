@@ -31,6 +31,10 @@ type Config struct {
 	// TokenFile is the projected service account token file. Mount and Unmount
 	// read it for every request so projected token rotation is observed.
 	TokenFile string
+	// ExportRootKeyFile is an optional capability key file. When configured,
+	// Mount reads it for every request and sends it only in an HTTP header. The
+	// wrapper requires it only when the effective NFS source is the export root.
+	ExportRootKeyFile string
 	// HTTPTimeout limits each wrapper request. Zero uses a 15-second default.
 	HTTPTimeout time.Duration
 	// DisableHTTPTimeout disables the client-wide request timeout. Callers
@@ -139,11 +143,12 @@ func (e *ResponseError) Error() string {
 // Client calls the node wrapper over a reusable HTTP-over-Unix-socket
 // transport. A Client is safe for concurrent use.
 type Client struct {
-	driverName string
-	socketPath string
-	tokenFile  string
-	httpClient *http.Client
-	transport  *http.Transport
+	driverName        string
+	socketPath        string
+	tokenFile         string
+	exportRootKeyFile string
+	httpClient        *http.Client
+	transport         *http.Transport
 }
 
 // NewClient validates config and creates a reusable node wrapper client.
@@ -177,9 +182,10 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		driverName: cfg.DriverName,
-		socketPath: cfg.SocketPath,
-		tokenFile:  cfg.TokenFile,
+		driverName:        cfg.DriverName,
+		socketPath:        cfg.SocketPath,
+		tokenFile:         cfg.TokenFile,
+		exportRootKeyFile: cfg.ExportRootKeyFile,
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   cfg.HTTPTimeout,
@@ -197,6 +203,10 @@ func (c *Client) Mount(ctx context.Context, request MountRequest) (*MountResult,
 	if err != nil {
 		return nil, err
 	}
+	exportRootKey, err := c.readExportRootKey()
+	if err != nil {
+		return nil, err
+	}
 
 	payload := api.MountRequest{
 		APIVersion:    api.Version,
@@ -210,7 +220,7 @@ func (c *Client) Mount(ctx context.Context, request MountRequest) (*MountResult,
 		ContainerName: request.ContainerName,
 	}
 	var result MountResult
-	if err := c.call(ctx, "mount", http.MethodPost, "/v1/mount", token, payload, &result); err != nil {
+	if err := c.call(ctx, "mount", http.MethodPost, "/v1/mount", token, exportRootKey, payload, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -238,7 +248,7 @@ func (c *Client) Unmount(ctx context.Context, request UnmountRequest) (*UnmountR
 		ContainerName: request.ContainerName,
 	}
 	var result UnmountResult
-	if err := c.call(ctx, "unmount", http.MethodPost, "/v1/unmount", token, payload, &result); err != nil {
+	if err := c.call(ctx, "unmount", http.MethodPost, "/v1/unmount", token, "", payload, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -247,7 +257,7 @@ func (c *Client) Unmount(ctx context.Context, request UnmountRequest) (*UnmountR
 // Health retrieves the node wrapper's unauthenticated health response.
 func (c *Client) Health(ctx context.Context) (*HealthResult, error) {
 	var result HealthResult
-	if err := c.call(ctx, "health", http.MethodGet, "/healthz", "", nil, &result); err != nil {
+	if err := c.call(ctx, "health", http.MethodGet, "/healthz", "", "", nil, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -274,6 +284,21 @@ func (c *Client) readToken() (string, error) {
 	return token, nil
 }
 
+func (c *Client) readExportRootKey() (string, error) {
+	if c.exportRootKeyFile == "" {
+		return "", nil
+	}
+	keyBytes, err := os.ReadFile(c.exportRootKeyFile)
+	if err != nil {
+		return "", fmt.Errorf("read export root key file: %w", err)
+	}
+	key := strings.TrimSpace(string(keyBytes))
+	if key == "" {
+		return "", fmt.Errorf("export root key file is empty")
+	}
+	return key, nil
+}
+
 func validateRequest(namespace, podName, podUID, pvName, targetPath string) error {
 	switch {
 	case namespace == "":
@@ -291,7 +316,7 @@ func validateRequest(namespace, podName, podUID, pvName, targetPath string) erro
 	}
 }
 
-func (c *Client) call(ctx context.Context, operation, method, endpoint, token string, payload, result any) error {
+func (c *Client) call(ctx context.Context, operation, method, endpoint, token, exportRootKey string, payload, result any) error {
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -311,6 +336,9 @@ func (c *Client) call(ctx context.Context, operation, method, endpoint, token st
 	}
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	if exportRootKey != "" {
+		request.Header.Set(api.ExportRootKeyHeader, exportRootKey)
 	}
 
 	response, err := c.httpClient.Do(request)

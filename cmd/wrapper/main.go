@@ -103,6 +103,7 @@ func bindWrapperFlags(flagSet *flag.FlagSet, cfg *config.WrapperConfig) {
 	flagSet.StringVar(&cfg.MountStateDir, "mount-state-dir", cfg.MountStateDir, "persistent desired mount state directory")
 	flagSet.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name used to watch local pods")
 	flagSet.StringVar(&cfg.HostProcRoot, "host-proc-root", cfg.HostProcRoot, "host proc root visible to wrapper")
+	flagSet.StringVar(&cfg.ExportRootKeyFile, "export-root-key-file", cfg.ExportRootKeyFile, "NFS export root capability key file")
 	flagSet.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
 	flagSet.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
 	flagSet.BoolVar(&cfg.CreateMissingSubPaths, "create-missing-subpaths", cfg.CreateMissingSubPaths, "create missing source subPath directories")

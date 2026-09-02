@@ -10,7 +10,7 @@ data:
     token_audience: kruise-agents-nfs-csi.zhida/sandbox-mounter
     mounter:
       # Build and publish this image before deploying the demo.
-      image: ghcr.io/example/kruise-agents-nfs-csi-mounter:v0.0.2
+      image: ghcr.io/example/kruise-agents-nfs-csi-mounter:v1.1.0
       restart_policy: Always
       command:
         - sh

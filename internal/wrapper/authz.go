@@ -12,6 +12,13 @@ import (
 
 var errBadRequest = errors.New("bad request")
 
+const (
+	allowNamespaceAnnotation      = "kary.dev/allow-namespace"
+	allowServiceAccountAnnotation = "kary.dev/allow-serviceaccount"
+	tokenPodNameExtraKey          = "authentication.kubernetes.io/pod-name"
+	tokenPodUIDExtraKey           = "authentication.kubernetes.io/pod-uid"
+)
+
 func validateRequestShape(driverName string, request *api.MountRequest) error {
 	if request.APIVersion != api.Version {
 		return fmt.Errorf("%w: api_version must be %s", errBadRequest, api.Version)
@@ -64,6 +71,23 @@ func authorizePod(tokenStatus *kube.TokenReviewStatus, pod *kube.Pod, request ap
 	if tokenStatus.User.Username != expectedUser {
 		return fmt.Errorf("token service account %s does not match pod service account %s", tokenStatus.User.Username, expectedUser)
 	}
+	if err := requireTokenPodExtra(tokenStatus.User.Extra, tokenPodNameExtraKey, request.PodName); err != nil {
+		return err
+	}
+	if err := requireTokenPodExtra(tokenStatus.User.Extra, tokenPodUIDExtraKey, request.PodUID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requireTokenPodExtra(extra map[string][]string, key, expected string) error {
+	values := extra[key]
+	if len(values) != 1 || values[0] == "" {
+		return fmt.Errorf("token must contain exactly one non-empty %s value", key)
+	}
+	if values[0] != expected {
+		return fmt.Errorf("token %s does not match target pod", key)
+	}
 	return nil
 }
 
@@ -87,37 +111,43 @@ func validatePodNode(pod *kube.Pod, nodeName string) error {
 	return nil
 }
 
-func validatePVClaimRefForPod(pod *kube.Pod, pv *kube.PersistentVolume) error {
-	if pv.Spec.ClaimRef == nil {
-		return fmt.Errorf("pv %s has no claimRef", pv.Metadata.Name)
-	}
-	if pv.Spec.ClaimRef.Namespace != pod.Metadata.Namespace {
-		return fmt.Errorf("pv %s claim namespace %s does not match pod namespace %s", pv.Metadata.Name, pv.Spec.ClaimRef.Namespace, pod.Metadata.Namespace)
-	}
-	if pv.Spec.ClaimRef.Name == "" {
-		return fmt.Errorf("pv %s claimRef has empty name", pv.Metadata.Name)
-	}
-	return nil
-}
-
-func authorizePVForPod(driverName string, pod *kube.Pod, pv *kube.PersistentVolume, pvc *kube.PersistentVolumeClaimResource) error {
+func authorizePVForPod(driverName string, pod *kube.Pod, pv *kube.PersistentVolume) error {
 	if pv.Spec.CSI == nil {
 		return fmt.Errorf("pv %s is not a CSI pv", pv.Metadata.Name)
 	}
 	if pv.Spec.CSI.Driver != driverName {
 		return fmt.Errorf("pv %s uses driver %s, expected %s", pv.Metadata.Name, pv.Spec.CSI.Driver, driverName)
 	}
-	if err := validatePVClaimRefForPod(pod, pv); err != nil {
+	if err := authorizePVAnnotation(pv, allowNamespaceAnnotation, pod.Metadata.Namespace); err != nil {
 		return err
 	}
-	if pvc == nil {
-		return fmt.Errorf("pvc %s/%s is required for pv %s", pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name, pv.Metadata.Name)
+	if err := authorizePVAnnotation(pv, allowServiceAccountAnnotation, pod.Spec.ServiceAccountName); err != nil {
+		return err
 	}
-	if pvc.Metadata.Namespace != pv.Spec.ClaimRef.Namespace || pvc.Metadata.Name != pv.Spec.ClaimRef.Name {
-		return fmt.Errorf("pvc identity mismatch for pv %s claimRef %s/%s", pv.Metadata.Name, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name)
+	return nil
+}
+
+func authorizePVAnnotation(pv *kube.PersistentVolume, key, identity string) error {
+	raw, configured := pv.Metadata.Annotations[key]
+	if !configured {
+		return nil
 	}
-	if pv.Spec.ClaimRef.UID != "" && pvc.Metadata.UID != "" && pvc.Metadata.UID != pv.Spec.ClaimRef.UID {
-		return fmt.Errorf("pvc %s/%s uid %s does not match pv %s claim uid %s", pvc.Metadata.Namespace, pvc.Metadata.Name, pvc.Metadata.UID, pv.Metadata.Name, pv.Spec.ClaimRef.UID)
+	if raw == "" {
+		return fmt.Errorf("pv %s annotation %s must contain a comma-separated allowlist", pv.Metadata.Name, key)
+	}
+
+	allowed := false
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" || entry == "*" {
+			return fmt.Errorf("pv %s annotation %s contains invalid entry", pv.Metadata.Name, key)
+		}
+		if entry == identity {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("pv %s annotation %s does not allow the target pod", pv.Metadata.Name, key)
 	}
 	return nil
 }
@@ -166,7 +196,10 @@ func buildMountPlan(request api.MountRequest, pod *kube.Pod, pv *kube.Persistent
 	attrs := pv.Spec.CSI.VolumeAttributes
 	server := firstNonEmpty(attrs["server"], attrs["mountOptions.server"])
 	share := firstNonEmpty(attrs["share"], attrs["mountOptions.share"])
-	subDir := firstNonEmpty(attrs["subDir"], attrs["subdir"])
+	subDir, err := node.NormalizeNFSSubDir(firstNonEmpty(attrs["subDir"], attrs["subdir"]))
+	if err != nil {
+		return node.MountPlan{}, fmt.Errorf("pv %s has invalid nfs subDir: %w", pv.Metadata.Name, err)
+	}
 	if server == "" || share == "" {
 		return node.MountPlan{}, fmt.Errorf("pv %s is missing nfs server/share volume attributes", pv.Metadata.Name)
 	}

@@ -10,12 +10,12 @@ images:
   wrapper:
     # Build and publish this image before installing the chart.
     repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
-    tag: v0.0.2
+    tag: v1.1.0
     pullPolicy: IfNotPresent
   mounter:
     # Build and publish this image before using the sidecar integration.
     repository: ghcr.io/example/kruise-agents-nfs-csi-mounter
-    tag: v0.0.2
+    tag: v1.1.0
     pullPolicy: IfNotPresent
   provisioner:
     repository: registry.k8s.io/sig-storage/csi-provisioner
@@ -80,6 +80,12 @@ wrapper:
   socketGroup: 2000
   socketDirMode: "0770"
   socketMode: "0660"
+  # Optional existing Secret that grants NFS export-root mount capability to
+  # the wrapper. The Secret value must be at least 32 visible ASCII chars.
+  # Leave name empty to deny all export-root mounts.
+  exportRootKeySecret:
+    name: ""
+    key: export-root-key
 
 storageClass:
   create: true

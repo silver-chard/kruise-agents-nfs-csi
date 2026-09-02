@@ -40,6 +40,7 @@ func main() {
 		DriverName:         request.Mount.DriverName,
 		SocketPath:         cfg.SocketPath,
 		TokenFile:          cfg.TokenFile,
+		ExportRootKeyFile:  cfg.ExportRootKeyFile,
 		HTTPTimeout:        httpTimeout,
 		DisableHTTPTimeout: cfg.HTTPTimeout <= 0,
 	})
@@ -167,6 +168,7 @@ func newRootCommand(state *commandState) *cobra.Command {
 func bindCommonFlags(command *cobra.Command, state *commandState) {
 	command.Flags().StringVar(&state.cfg.SocketPath, "socket-path", state.cfg.SocketPath, "wrapper Unix socket path")
 	command.Flags().StringVar(&state.cfg.TokenFile, "token-file", state.cfg.TokenFile, "projected service account token file")
+	command.Flags().StringVar(&state.cfg.ExportRootKeyFile, "export-root-key-file", state.cfg.ExportRootKeyFile, "optional NFS export root capability key file")
 	command.Flags().StringVar(&state.request.DriverName, "driver", state.request.DriverName, "CSI driver name")
 	command.Flags().StringVar(&state.request.DriverName, "driver-name", state.request.DriverName, "CSI driver name")
 	command.Flags().StringVar(&state.request.Namespace, "namespace", state.request.Namespace, "requesting pod namespace")

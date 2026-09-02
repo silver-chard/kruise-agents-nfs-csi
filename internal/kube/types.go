@@ -39,17 +39,17 @@ type TokenReviewResponse struct {
 }
 
 type TokenReviewStatus struct {
-	Authenticated bool              `json:"authenticated"`
-	Audiences     []string          `json:"audiences"`
-	User          TokenReviewUser   `json:"user"`
-	Error         string            `json:"error"`
-	Extra         map[string]string `json:"extra"`
+	Authenticated bool            `json:"authenticated"`
+	Audiences     []string        `json:"audiences"`
+	User          TokenReviewUser `json:"user"`
+	Error         string          `json:"error"`
 }
 
 type TokenReviewUser struct {
-	Username string   `json:"username"`
-	UID      string   `json:"uid"`
-	Groups   []string `json:"groups"`
+	Username string              `json:"username"`
+	UID      string              `json:"uid"`
+	Groups   []string            `json:"groups"`
+	Extra    map[string][]string `json:"extra"`
 }
 
 type Pod struct {
@@ -104,10 +104,6 @@ type ContainerStatus struct {
 type PersistentVolume struct {
 	Metadata ObjectMeta           `json:"metadata"`
 	Spec     PersistentVolumeSpec `json:"spec"`
-}
-
-type PersistentVolumeClaimResource struct {
-	Metadata ObjectMeta `json:"metadata"`
 }
 
 type PersistentVolumeSpec struct {

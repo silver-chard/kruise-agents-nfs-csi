@@ -20,6 +20,7 @@ func TestBindWrapperFlagsSubPathConfig(t *testing.T) {
 	if err := flagSet.Parse([]string{
 		"--create-missing-subpaths=true",
 		"--created-subpath-mode=2770",
+		"--export-root-key-file=/run/secrets/export-root-key",
 	}); err != nil {
 		t.Fatalf("parse wrapper flags: %v", err)
 	}
@@ -29,6 +30,9 @@ func TestBindWrapperFlagsSubPathConfig(t *testing.T) {
 	wantMode := os.FileMode(0o770) | os.ModeSetgid
 	if cfg.CreatedSubPathMode != wantMode {
 		t.Fatalf("CreatedSubPathMode = %s, want 2770", config.FormatFileMode(cfg.CreatedSubPathMode))
+	}
+	if cfg.ExportRootKeyFile != "/run/secrets/export-root-key" {
+		t.Fatalf("ExportRootKeyFile = %q, want configured path", cfg.ExportRootKeyFile)
 	}
 }
 

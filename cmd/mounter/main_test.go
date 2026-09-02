@@ -112,8 +112,9 @@ func TestParseDirectRequestWithSourceSubPath(t *testing.T) {
 	t.Setenv("POD_NAME", "sandbox-pod")
 	t.Setenv("POD_UID", "pod-uid")
 
-	_, request, err := parseRequest([]string{
+	parsedConfig, request, err := parseRequest([]string{
 		"--driver-name", "csi.nfs.zhida",
+		"--export-root-key-file", "/run/secrets/export-root-key",
 		"--pv", "pv-a",
 		"--sub-path", "users/alice",
 		"--target", "/workspace/data",
@@ -128,6 +129,9 @@ func TestParseDirectRequestWithSourceSubPath(t *testing.T) {
 	}
 	if request.Mount.SourceSubPath != "users/alice" {
 		t.Fatalf("source sub path = %q, want users/alice", request.Mount.SourceSubPath)
+	}
+	if parsedConfig.ExportRootKeyFile != "/run/secrets/export-root-key" {
+		t.Fatalf("export root key file = %q, want configured path", parsedConfig.ExportRootKeyFile)
 	}
 }
 
