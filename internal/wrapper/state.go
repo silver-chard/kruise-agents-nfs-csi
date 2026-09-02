@@ -20,10 +20,16 @@ const (
 )
 
 type desiredMount struct {
-	Request                  api.MountRequest `json:"request"`
-	ContainerID              string           `json:"container_id,omitempty"`
-	ExportRootAuthorized     bool             `json:"export_root_authorized,omitempty"`
-	ExportRootKeyFingerprint string           `json:"export_root_key_fingerprint,omitempty"`
+	Request     api.MountRequest `json:"request"`
+	ContainerID string           `json:"container_id,omitempty"`
+	// legacyRootClassificationUnknown marks version 1 state, which did not
+	// record whether its effective source selected the NFS export root.
+	legacyRootClassificationUnknown bool `json:"-"`
+	// ExportRootAuthorized records that this intent selected the NFS export
+	// root and passed the policy active when it was accepted. The fingerprint
+	// is present only when that policy required a key.
+	ExportRootAuthorized     bool   `json:"export_root_authorized,omitempty"`
+	ExportRootKeyFingerprint string `json:"export_root_key_fingerprint,omitempty"`
 }
 
 type desiredMountKey struct {
@@ -111,6 +117,11 @@ func newFileMountStateStore(dir string) (*fileMountStateStore, error) {
 		}
 		if state.Version != legacyMountStateVersion && state.Version != mountStateVersion {
 			return nil, fmt.Errorf("mount state %s has unsupported version %d", path, state.Version)
+		}
+		if state.Version == legacyMountStateVersion {
+			state.Mount.ExportRootAuthorized = false
+			state.Mount.ExportRootKeyFingerprint = ""
+			state.Mount.legacyRootClassificationUnknown = true
 		}
 		key := state.Mount.key()
 		if entry.Name() != mountStateFilename(key) {

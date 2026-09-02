@@ -100,7 +100,7 @@ Kubernetes API
 - TokenReview：`internal/wrapper/server.go` 的 `authorizedPodForRequest` 调用 `ReviewToken`，并校验 dedicated audience。
 - 校验 live Pod identity、Pod-bound token 的 name/UID extra、PV driver 与 annotation allowlist、container status：`internal/wrapper/authz.go`。
 - 构造节点 mount plan：`internal/wrapper/authz.go` 的 `buildMountPlan`。
-- 对实际选择 NFS export 根的请求校验启动时加载的 export-root key：`internal/wrapper/rootauth.go`。
+- 对实际选择 NFS export 根的请求，在启动时配置了 export-root key 时增加 key 校验：`internal/wrapper/rootauth.go`。
 - 调用节点 mount executor：`internal/node/mounter_linux.go:34` `Mount`。
 
 ### CSI Driver
@@ -147,7 +147,7 @@ provision/publish 仍沿用 upstream driver 的控制面和节点能力。
 8. wrapper 只读取 PV，不查询 PVC，也不读取或约束 PV `claimRef`。PV 必须是目标 driver 的 CSI PV；可选 annotation `kary.dev/allow-namespace` 与 `kary.dev/allow-serviceaccount` 分别是 namespace 和 Pod service account 名称的逗号分隔 allowlist。某个 annotation 缺失表示该维度不限制；同时存在时两者按 AND 生效；存在但为空、含空项或含 `*` 时拒绝，见 `internal/wrapper/authz.go` 的 `authorizePVForPod`。
 9. wrapper 选择目标容器 status，取得 container ID，见 `internal/wrapper/authz.go` 的 `selectContainerStatus`。
 10. wrapper 从 PV CSI volumeAttributes 中取 NFS `server`、`share`、`subDir/subdir`，规范化 `subDir` 并构造 `node.MountPlan`，见 `internal/wrapper/authz.go` 的 `buildMountPlan` 与 `internal/node/nfspath.go`。
-11. 当规范化后的 PV `subDir` 为空且请求 `source_sub_path` 也为空时，请求选择的是 NFS `share`（export 根），wrapper 要求 `X-Kary-Export-Root-Key` 与其启动时从 `WRAPPER_EXPORT_ROOT_KEY_FILE` 加载的 key 匹配；未配置 key 时所有 export-root mount 都被拒绝。PV `subDir` 非空时，即使请求挂载该 PV 的根，也已经位于 NFS export 的子目录内，不需要这个 key；PV `subDir` 为空但请求指定非空 `source_sub_path` 时同样不需要 key，见 `internal/wrapper/rootauth.go` 与 `internal/node/nfspath.go`。
+11. 当规范化后的 PV `subDir` 为空且请求 `source_sub_path` 也为空时，请求选择的是 NFS `share`（export 根）。wrapper 未配置 `WRAPPER_EXPORT_ROOT_KEY_FILE` 时，不增加 key 限制，只执行 Pod-bound token、实时 Pod、PV annotation、driver、container 和路径等既有规则；配置 key 时，还要求 `X-Kary-Export-Root-Key` 与启动时加载的 key 匹配，且 key 不能绕过 annotation。PV `subDir` 非空时，即使请求挂载该 PV 的根，也已经位于 NFS export 的子目录内，不使用这个 key；PV `subDir` 为空但请求指定非空 `source_sub_path` 时同样不使用 key，见 `internal/wrapper/rootauth.go` 与 `internal/node/nfspath.go`。
 12. node mounter 对同一 PV 使用分段锁，创建 staging path，必要时执行 `mount -t nfs` 到 staging path，见 `internal/node/mounter_linux.go` 的 `Mount` 与 `mountNFS`。
 13. node mounter 根据 Pod UID 和 container ID 在 host `/proc` 中找目标 PID，打开 `/proc/<pid>/ns/mnt`，进入目标容器 mount namespace，使用 `open_tree` 克隆 staging mount，再用 `move_mount` 挂到目标路径，见 `internal/node/mounter_linux.go` 的 `findContainerPID` 与 `bindMountIntoContainerNamespace`。
 14. 如果 `UnstageAfterMount` 开启，wrapper 在完成动态 bind 后清理 staging mount 和 staging 目录，见 `internal/node/mounter_linux.go`。
@@ -220,7 +220,9 @@ provision/publish 仍沿用 upstream driver 的控制面和节点能力。
 
 ### 状态重协调
 
-【代码事实】wrapper 使用节点本地状态目录记录不含 token 和原始 export-root key 的期望挂载，每个挂载独立写入一个 `0600`、version 2 的文件；旧 version 1 状态仍可读取。状态额外保存该意图是否曾通过 export-root key 校验，以及 authorizing key 的 SHA-256 fingerprint，并为本节点 Pod 建立一个按 `spec.nodeName` 过滤的 `SharedIndexInformer`。当目标容器的 `containerID` 变化时，wrapper 重新校验 live Pod identity/node、PV driver 与当前 annotation allowlist，并挂入新 mount namespace；若当前计划选择 NFS export 根，则状态必须保存过 root 授权，且 fingerprint 必须匹配 wrapper 当前启动 key。wrapper 不保存 token，因此重协调不重新执行 TokenReview；也不保存原始 key。Pod 删除、终态、UID 不匹配或离开当前节点时删除过期状态记录。PID/cgroup 短暂不可见时，只对失败挂载做固定 worker 数量的有界退避重试，不按 Pod 周期扫描。同一 container ID 未变化时重协调直接返回，因此 annotation 或 key 变化不会主动卸载已经存在的挂载；可信 caller 可以用新 key 重复 mount 刷新 fingerprint。
+【代码事实】wrapper 使用节点本地状态目录记录不含 token 和原始 export-root key 的期望挂载，每个挂载独立写入一个 `0600`、version 2 的文件；旧 version 1 状态仍可读取。`export_root_authorized` 表示 root intent 已通过当时的完整策略：annotation-only root mount 也设为 true，但 fingerprint 为空；key 模式还保存 authorizing key 的 SHA-256 fingerprint。wrapper 为本节点 Pod 建立一个按 `spec.nodeName` 过滤的 `SharedIndexInformer`。当目标容器的 `containerID` 变化时，wrapper 重新校验 live Pod identity/node、PV driver 与当前 annotation allowlist，并挂入新 mount namespace；annotation-only 模式要求已保存 root 授权但不要求 fingerprint，key 模式还要求 fingerprint 匹配当前启动 key。旧 version 1 没有 root/非 root 分类，加载后以内存 unknown 标记；目标容器换代重协调时，未配置 key 可按当前 live PV plan 和 policy 补齐分类并恢复，配置 key 且 live plan 为 root 时 fail closed，需 exact-Pod `Unmount` 后携带有效 key 重新 `Mount`，live plan 为非 root 时无需 key。wrapper 不保存 token，因此重协调不重新执行 TokenReview；也不保存原始 key。Pod 删除、终态、UID 不匹配或离开当前节点时删除过期状态记录。PID/cgroup 短暂不可见时，只对失败挂载做固定 worker 数量的有界退避重试，不按 Pod 周期扫描。同一 container ID 未变化时重协调直接返回，因此 annotation 或 key 变化不会主动卸载已经存在的挂载；可信 caller 可以用当前 key 重复完全相同的 mount intent 刷新 fingerprint。普通 state v2 的同一 target 若要切换 intent 或 root/非 root 分类则 fail closed，必须先 `Unmount`。
+
+【代码事实】v1.1.1 保持 state version 2。v1.1.0 可解析该格式，但会把 v1.1.1 写入的 annotation-only root state（已授权、空 fingerprint）作为 fail closed 处理，并可能在重协调时清理；回滚前需显式 unmount 这类 intent。
 
 ## 8. 与其他方案的区别
 
@@ -249,7 +251,7 @@ provision/publish 仍沿用 upstream driver 的控制面和节点能力。
 
 - mount propagation 需要预先设计 shared/bidirectional volume 拓扑，且目标路径通常仍受 Pod spec 和共享目录限制。
 - 本方案不要求业务容器提前暴露通用共享目录；目标路径由 runtime 请求给出，并由 wrapper 校验后进入目标容器 namespace 绑定。
-- mount propagation 不能替代 token、live Pod、PV annotation policy、目标容器身份和 export-root key 校验。
+- mount propagation 不能替代 token、live Pod、PV annotation policy、目标容器身份和已配置时的 export-root key 校验。
 
 ### 与 LXD 运行时目录注入的区别
 
@@ -277,7 +279,7 @@ provision/publish 仍沿用 upstream driver 的控制面和节点能力。
 - HTTP over UDS 的 `/v1/mount`。
 - projected Pod-bound token + TokenReview + audience + 精确 Pod name/UID extra 校验。
 - live Pod/PV 校验，以及 PV namespace/service account annotation allowlist；动态路径不查询 PVC/`claimRef`。
-- NFS export-root key 校验；PV 自身位于 NFS `subDir` 时，挂载 PV 根不要求 key。
+- 可选 NFS export-root key 校验；未配置时 root 只受其他策略限制，PV 自身位于 NFS `subDir` 时不使用 key。
 - driver name 可配置，默认 `csi.nfs.zhida`。
 - target path denylist。
 - 已挂载 target path 拒绝。
@@ -329,11 +331,11 @@ export-root key、状态/卸载边界，以及对应的 wrapper/mounter 配置�
 | wrapper 启动 | `cmd/wrapper/main.go` | 加载配置、启动 kube client、node mounter、UDS server |
 | UDS 监听 | `cmd/wrapper/main.go:90` `listenUnix` | 创建 socket 并设置权限 |
 | HTTP handler | `internal/wrapper/server.go:59` `handleMount` | 接收 `/v1/mount` |
-| mount 主流程 | `internal/wrapper/server.go` `mount` | 请求校验、TokenReview、Pod/PV policy、export-root key、调用 node mounter |
+| mount 主流程 | `internal/wrapper/server.go` `mount` | 请求校验、TokenReview、Pod/PV policy、可选 export-root key、调用 node mounter |
 | token 校验 | `internal/wrapper/authz.go` `authorizeToken` | 校验 authenticated、namespace、audience |
 | Pod 校验 | `internal/wrapper/authz.go` `authorizePod` | 校验 Pod identity、service account、phase 与 token Pod name/UID extra |
 | PV 校验 | `internal/wrapper/authz.go` `authorizePVForPod` | 校验 CSI driver、namespace/service account annotation allowlist；不读取 PVC/`claimRef` |
-| export-root 授权 | `internal/wrapper/rootauth.go` `authorize` | 仅 NFS share 根要求启动时加载的 key |
+| export-root 授权 | `internal/wrapper/rootauth.go` `authorize` | 仅 NFS share 根且 wrapper 配置 key 时增加 key 校验 |
 | 目标容器选择 | `internal/wrapper/authz.go:111` `selectContainerStatus` | container_name / SANDBOX_MAIN_CONTAINER / single-container fallback |
 | mount plan | `internal/wrapper/authz.go:151` `buildMountPlan` | 从 PV attributes 构造 NFS source |
 | target path 安全 | `internal/security/targetpath.go:35` `ValidateTargetPath` | 拒绝 `/`、`/proc`、secret、kubelet 等危险路径 |
@@ -383,7 +385,7 @@ git log 中；本文不记录邮箱。
 【代码事实 / 设计规划】
 
 - 当前 PV policy 粒度是可选的 namespace + service account allowlist 和 driver identity；annotation 全部缺失即对所有通过 Pod-bound token 校验的 Pod 开放，且仍不是逐 Pod/target/时效授权。
-- export-root key 是共享 bearer capability；状态不保存 key 原文，但会保存“曾通过 root 授权”的布尔值和 authorizing key 的 SHA-256 fingerprint。key 轮换或移除不会主动卸载已有 Linux mount；wrapper 用新 key 重启后，旧 fingerprint 不再允许容器重启时自动恢复，除非可信 caller 用新 key 重复 mount 来刷新 state。
+- export-root key 是可选的共享 bearer capability；状态不保存 key 原文。root intent 通过完整策略后保存授权标志，annotation-only 模式 fingerprint 为空，key 模式才保存 authorizing key 的 SHA-256 fingerprint。key 增加、轮换或移除不会主动卸载已有 Linux mount；key 模式只恢复 fingerprint 匹配的 intent，移除 key 后 annotation-only 模式可在重新校验后恢复已授权 intent 并清除旧 fingerprint。
 - 当前目标容器 PID 查找依赖 host `/proc/*/cgroup` 字符串匹配，可能受 CRI、cgroup v2、节点发行版影响。
 - 当前 target path denylist 是静态规则，后续可能需要按业务策略配置。
 - 当前没有完整 metrics、审计事件、结构化错误码。
@@ -397,11 +399,11 @@ git log 中；本文不记录邮箱。
 - 使用 CRI API 查 PID：wrapper 通过 CRI RuntimeService 查询 sandbox/container 状态，替代 `/proc` 扫描。优点是更语义化；缺点是需要访问 CRI socket 并适配 runtime 差异。
 - 状态 CRD + reconciler：记录动态 mount 状态，支持重试、卸载、Pod 删除清理和审计。优点是系统化；缺点是实现复杂度和权限面增加。
 - 限制 target path 模板：只允许挂到 runtime 管控的一组路径。优点是安全简单；缺点是不能满足“任意业务路径”诉求。
-- 保持当前最小实现：继续用 UDS + Pod-bound TokenReview + live Pod/PV annotation policy + export-root key + node wrapper mount namespace 操作。优点是简单、低侵入；缺点是 annotation 和共享 key 的授权粒度、主动撤销与重协调边界需要由部署策略补强。
+- 保持当前最小实现：继续用 UDS + Pod-bound TokenReview + live Pod/PV annotation policy + 可选 export-root key + node wrapper mount namespace 操作。优点是简单、低侵入；缺点是 annotation 和共享 key 的授权粒度、主动撤销与重协调边界需要由部署策略补强。
 
 ## 结论
 
-【代码事实】当前仓库已经实现“低权限 mounter 通过 UDS 请求节点 wrapper，wrapper 校验 Pod-bound token、live Pod、PV driver/annotation policy 和必要的 export-root key 后，进入目标容器 mount namespace 动态挂载 NFS PV”的核心闭环。动态路径不依赖 PVC/`claimRef`；普通 PVC provision/publish 仍由 upstream CSI 处理。该闭环的关键代码集中在 `cmd/mounter`、`internal/wrapper` 和 `internal/node`。
+【代码事实】当前仓库已经实现“低权限 mounter 通过 UDS 请求节点 wrapper，wrapper 校验 Pod-bound token、live Pod、PV driver/annotation policy 和配置后必要的 export-root key，再进入目标容器 mount namespace 动态挂载 NFS PV”的核心闭环。动态路径不依赖 PVC/`claimRef`；普通 PVC provision/publish 仍由 upstream CSI 处理。该闭环的关键代码集中在 `cmd/mounter`、`internal/wrapper` 和 `internal/node`。
 
 【设计规划】完整产品化还需要补齐逐 Pod 授权、runtime/CRI 兼容性、规模化重协调验证和审计可观测能力。
 

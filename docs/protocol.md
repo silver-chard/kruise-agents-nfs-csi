@@ -37,8 +37,11 @@ X-Kary-Export-Root-Key: <export-root-capability-key>
 ```
 
 The capability key is an optional HTTP header, not a JSON field. It is ignored
-for effective NFS subpaths and required only when both the PV CSI `subDir` and
-the request `source_sub_path` normalize to empty. Clients must not log it.
+for effective NFS subpaths. It is required when both the PV CSI `subDir` and
+the request `source_sub_path` normalize to empty only if the wrapper was
+started with a root key. Without a wrapper key, root mounts use the same
+exact-Pod and PV annotation policy as other mounts, with no extra key check.
+The key never bypasses those checks, and clients must not log it.
 
 Unmount uses the same exact-Pod identity model, but does not send or require the
 export-root key:

@@ -48,7 +48,7 @@ For every mount request the wrapper:
 6. evaluates the PV's namespace and service account annotation allowlists;
 7. validates the NFS source, request subpath, and target path denylist;
 8. requires an additional capability key if the effective source is the NFS
-   export root; and
+   export root and the wrapper was started with root-key protection; and
 9. refuses to continue when the target path is already a mount point.
 
 The request body does not contain NFS server credentials. NFS mount source data
@@ -122,9 +122,9 @@ cleanup.
 relative to the configured NFS share. The wrapper treats a request as an NFS
 export-root mount only when both values normalize to empty:
 
-| PV CSI `subDir` | Request `source_sub_path` | Effective source | Key required |
+| PV CSI `subDir` | Request `source_sub_path` | Effective source | Additional key check |
 | --- | --- | --- | --- |
-| empty | empty | NFS export root | yes |
+| empty | empty | NFS export root | only when the wrapper key is configured |
 | empty | non-empty | request directory below export root | no |
 | non-empty | empty | PV root below the export | no |
 | non-empty | non-empty | request directory below the PV root | no |
@@ -140,8 +140,12 @@ The wrapper reads the capability from `WRAPPER_EXPORT_ROOT_KEY_FILE` or
 4096 visible ASCII characters and should be generated randomly. The authorizer
 retains only its SHA-256 hash in memory for constant-time comparison; the
 plaintext is not added to mount state.
-If the option is absent, export-root mounting is disabled. Changing the file
-requires restarting the wrapper because it is a startup credential.
+If the option is absent, the wrapper applies no additional root-key check:
+export-root mounts still require all exact-Pod, live-Pod, PV annotation,
+driver, container, and path checks. If the option is present, a root request
+with a missing or different key is denied. The key never bypasses another
+authorization check. Changing the file requires restarting the wrapper because
+it is a startup credential.
 
 An authorized mounter uses `EXPORT_ROOT_KEY_FILE` or
 `--export-root-key-file`; the Go SDK uses `Config.ExportRootKeyFile`. The client
@@ -150,11 +154,13 @@ reads the file for each mount and places the value only in the
 JSON request field nor an unmount credential, and clients must not log it.
 
 For Helm deployments, `wrapper.exportRootKeySecret.name` and
-`wrapper.exportRootKeySecret.key` select an existing Secret in the release
-namespace. The chart mounts that key read-only into the wrapper with mode
-`0400`; it does not create or distribute the Secret to mounter clients. Only
-clients explicitly trusted to mount the NFS export root should receive the same
-Secret.
+`wrapper.exportRootKeySecret.key` select an existing Secret in the wrapper
+DaemonSet namespace (the release namespace unless `namespace` overrides it).
+The chart mounts that key read-only into the wrapper with mode `0400`; it does
+not create the Secret, read one from another namespace, or distribute it to
+mounter clients. An empty Secret name configures
+annotation-only root authorization. When a Secret is selected, only clients
+explicitly trusted to mount the NFS export root should receive the same value.
 
 ## Source SubPath Creation
 
@@ -190,29 +196,42 @@ umask, default ACL, owner, or group configuration.
 
 After the initial authenticated mount succeeds, the wrapper stores only the
 normalized Pod/PV/container/target mount intent and the mounted container ID in
-its node-local state directory. State format v2 also stores the boolean
-`export_root_authorized` and the SHA-256 fingerprint of the authorizing key.
-Reconciliation permits a previously authorized export-root mount only while
-that fingerprint matches the wrapper's current startup key. Each
-desired mount has its own `0600` file, so updates do not rewrite every Pod's
-state. It does not persist the projected bearer token, export-root key, NFS
-credentials, or a caller-supplied NFS server. Legacy state v1 loads with root
-authorization set to false and therefore cannot silently authorize a new
-export-root mount during reconciliation.
+its node-local state directory. In state format v2,
+`export_root_authorized` means an export-root intent passed the complete policy
+in effect at mount time. Annotation-only root mounts set that marker with an
+empty fingerprint; key-protected root mounts additionally store the
+authorizing key's SHA-256 fingerprint. Each desired mount has its own `0600`
+file, so updates do not rewrite every Pod's state. The state does not persist
+the projected bearer token, plaintext export-root key, NFS credentials, or a
+caller-supplied NFS server.
 
-This upgrade is intentionally fail closed in the reverse direction: a legacy
-wrapper that only understands state v1 rejects v2 files instead of ignoring the
-new authorization metadata. Before rolling back to such a wrapper, drain or
-explicitly unmount dynamic mounts and plan the node-state migration; do not
-silently discard live desired-mount state.
+Legacy state v1 has no root/non-root classification and is represented as
+unknown in memory. When a replacement container triggers reconciliation, a
+wrapper without a key uses the current live PV plan and policy to backfill the
+classification and may restore the intent. With a wrapper key, a legacy intent
+whose current live plan is the export root fails closed; the exact Pod must
+call `Unmount` and then issue a valid keyed `Mount`. A legacy intent whose live
+plan is non-root does not need the key. For
+ordinary state v2, a changed mount intent or root/non-root classification for
+the same target fails closed and requires `Unmount` followed by `Mount`.
 
-Rotating the key does not actively unmount an existing Linux mount. After the
-wrapper restarts with the new key, a trusted caller can repeat the same mount
-request with that key to refresh the saved fingerprint without stacking a new
-mount. Until then, a later container restart will not automatically restore the
-old-key export-root intent. Wrapper and client Secret updates must be
-coordinated because the wrapper reads only at startup while clients read before
-each mount.
+The state format remains v2, so v1.1.0 can parse files written by v1.1.1.
+However, v1.1.0 requires a fingerprint for every authorized root intent and
+therefore rejects, and may remove during reconciliation, v1.1.1
+annotation-only root state. Explicitly unmount those intents before a
+downgrade; do not rely on rollback to preserve their automatic restoration.
+
+In key-protected mode, reconciliation restores an export-root intent only when
+its state is authorized and its fingerprint matches the current wrapper key.
+An older annotation-only root intent therefore does not automatically restore
+after key protection is enabled. A trusted caller holding the current key can
+repeat the same mount request to upgrade or refresh state without stacking a
+new mount. Removing the wrapper key switches back to annotation-only mode;
+after live authorization succeeds, the wrapper can restore an authorized root
+intent and clears any stale fingerprint. Adding, rotating, or removing the key
+does not actively unmount an existing Linux mount. Wrapper and client Secret
+updates must be coordinated because the wrapper reads only at startup while
+clients read before each mount.
 
 The wrapper runs one `SharedIndexInformer` filtered by its own node name. The
 informer owns LIST/WATCH cache synchronization, resource-version handling, and
@@ -220,10 +239,11 @@ reconnection; the wrapper does not issue periodic GET requests for every saved
 Pod. When an informer event reports a different container ID for the same Pod
 UID and container name, the wrapper validates the live Pod, PV, driver, and PV
 annotation policy again before mounting into the replacement container
-namespace. An export-root plan is restored only when the saved v2 state records
-the original root authorization and its key fingerprint matches the current
-wrapper key. A deleted, terminal, UID-mismatched, or
-different-node Pod makes the saved intent stale and removes it.
+namespace. An export-root plan follows the current wrapper mode:
+annotation-only mode requires the saved root-authorization marker but no
+fingerprint, while key-protected mode additionally requires a fingerprint
+matching the current key. A deleted, terminal, UID-mismatched, or different-node
+Pod makes the saved intent stale and removes it.
 
 Explicit unmount first requires exact-Pod authentication and a saved intent
 whose Pod UID, container, target, and PV match. It does not fetch the PV or

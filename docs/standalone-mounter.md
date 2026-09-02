@@ -19,8 +19,8 @@ service account token 并通过 Unix domain socket 发送请求，不需要 priv
 - projected token 的 audience 与 wrapper `TOKEN_AUDIENCE` 一致，并且 token
   绑定当前 Pod。
 - wrapper socket 的 group/mode 与 sidecar 的 `runAsGroup` 匹配。
-- 如果有效 NFS 路径是 `share` root，wrapper 和调用方还需共享一个
-  export root capability key 文件；非 root mount 不需要。
+- 如果 wrapper 配置了 export root capability key，则有效 NFS 路径是
+  `share` root 的调用方还需持有相同 key；未配置时不增加这项限制。
 
 PV 不需要 PVC 或 `claimRef`。wrapper 不读取它们做 mount 授权；PV 提供
 NFS 参数，实时 Pod identity 和 PV annotation 提供授权边界，真正的节点挂载由
@@ -33,7 +33,7 @@ wrapper 完成。
 | `DRIVER_NAME` | `csi.nfs.zhida` | 必须与 wrapper、CSIDriver 和 PV `spec.csi.driver` 一致。 |
 | `WRAPPER_SOCKET_PATH` | `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | sidecar 内可见的 wrapper socket。 |
 | `PROJECTED_TOKEN_FILE` | `/var/run/secrets/kruise-agents-nfs-csi/token` | projected service account token 文件。 |
-| `EXPORT_ROOT_KEY_FILE` | 空 | 可选 export root capability key 文件；非 root mount 保持为空。 |
+| `EXPORT_ROOT_KEY_FILE` | 空 | 可选 export root capability key 文件；仅在 wrapper 已启用 root-key 限制且请求有效 NFS root 时配置。 |
 | `POD_NAMESPACE` | 文件 fallback | 当前 Pod namespace，建议使用 Downward API。 |
 | `POD_NAME` | 文件或 `/etc/hostname` fallback | 当前 Pod name，建议使用 Downward API。 |
 | `POD_UID` | 文件 fallback | 当前 Pod UID，必须使用 Downward API。 |
@@ -207,20 +207,22 @@ kubectl -n dynamic-nfs-demo exec pod/dynamic-nfs-workload -c main -- \
 wrapper 用 PV CSI `volumeAttributes["subDir"]`（兼容 `subdir`）和请求
 `--sub-path` 共同判定有效 NFS 路径：
 
-| PV `subDir` | `--sub-path` | 有效位置 | 需要 key |
+| PV `subDir` | `--sub-path` | 有效位置 | 额外 key 校验 |
 | --- | --- | --- | --- |
-| 空 | 空 | NFS `share` root | 是 |
+| 空 | 空 | NFS `share` root | 仅 wrapper 配置 key 时 |
 | 空 | `users/alice` | `share/users/alice` | 否 |
 | `tenants/team-a` | 空 | `share/tenants/team-a` | 否 |
 | `tenants/team-a` | `workspace` | `share/tenants/team-a/workspace` | 否 |
 
 PV `subDir` 归一化后为空、仅 `/` 或仅 `.` 都表示 share root；包含 NUL 或任意
 `..` 路径段会被拒绝。`--sub-path` 空或归一化为 `.` 表示 PV root；绝对路径、
-NUL 和 `..` 会被拒绝。只有两者归一化后都为空才需要 key。
+NUL 和 `..` 会被拒绝。只有两者归一化后都为空才可能触发额外 key 校验。
 
 wrapper 通过 `WRAPPER_EXPORT_ROOT_KEY_FILE` / `--export-root-key-file` 配置
-服务端 key；未配置时只拒绝 export root mount，不影响非 root mount。调用方
-把相同 Secret 只读挂入 sidecar，然后在 root mount 上指定：
+服务端 key。未配置时，export root mount 只受 exact Pod token、实时 Pod、PV
+annotation、driver、container 和路径等既有规则限制。配置后，root mount 还必须
+提供相同 key；key 不能绕过 annotation 或其他校验。调用方把相同 Secret 只读
+挂入 sidecar，然后在 root mount 上指定：
 
 ```sh
 kruise-nfs-mounter mount \
@@ -231,13 +233,27 @@ kruise-nfs-mounter mount \
 ```
 
 也可以设置 `EXPORT_ROOT_KEY_FILE`。key 只通过
-`X-Kary-Export-Root-Key` header 发送，不进入 JSON 或持久化 state；state 保存
-该 mount 已通过 root 授权的布尔值和 key 的 SHA-256 fingerprint，不保存 key
-原文。不要把 key 放进环境变量值、PV annotation 或日志。wrapper 在启动时读取
-key，替换文件后需重启 wrapper；mounter 每次 mount 都重新读取调用方文件。
-轮换后，已有 Linux mount 不会被主动卸载；可信 caller 应用新 key 重复同一个
-mount 请求，以无叠加方式刷新 state fingerprint，否则下一次容器重启不会自动
-恢复旧 key 授权的 export root mount。
+`X-Kary-Export-Root-Key` header 发送，不进入 JSON 或持久化 state；state v2 的
+root 授权标志表示 intent 已通过当时的完整策略。annotation-only root mount 也会
+设置该标志，但 fingerprint 为空；key 模式才保存 key 的 SHA-256 fingerprint，
+且不保存 key 原文。不要把 key 放进环境变量值、PV annotation 或日志。wrapper
+在启动时读取 key，替换文件后需重启 wrapper；mounter 每次 mount 都重新读取
+调用方文件。
+
+启用或轮换 key 后，已有 Linux mount 不会被主动卸载；旧的无 fingerprint root
+intent 不会在 key 模式下自动恢复。持有当前 key 的可信 caller 可重复同一 mount
+请求，以无叠加方式升级或刷新 state。移除 wrapper key 后，annotation-only 模式
+可以在重新校验现有规则后恢复 root intent，并清除旧 fingerprint。
+
+旧 state v1 没有 root/非 root 分类，加载后以内存 unknown 标记。目标容器换代
+触发重协调时，wrapper 未配置 key 会按当前 live PV plan 和现有 policy 补齐分类
+并可恢复；配置 key 且 live plan 是 export root 时 fail closed，需由精确 Pod
+身份 `Unmount` 后携带有效 key 重新 `Mount`。live plan 是非 root 时不需要 key。
+普通 state v2 的同一 target 若要切换 mount intent 或 root/非 root 分类会被阻断，
+也必须先 `Unmount` 再 `Mount`。
+
+回滚到 v1.1.0 前也应显式 unmount v1.1.1 annotation-only root intent；旧 wrapper
+虽能读取 state v2，但会因 fingerprint 为空而 fail closed。
 
 ## Unmount
 
@@ -314,6 +330,6 @@ wrapper 会返回错误，不会自动覆盖或卸载现有 mount。调用方应
 
 挂载属于具体容器的 mount namespace。wrapper 会观察同一 Pod UID 的 container ID
 变化，重新校验实时 Pod、PV driver 和 annotation 后恢复挂载。节点 state 不保存
-token、export root key 或 NFS 凭据；export root mount 只会在已登记授权和 key
-fingerprint 仍匹配 wrapper 当前启动 key 时恢复。
+token、export root key 或 NFS 凭据；annotation-only 模式要求已登记 root 授权但
+不要求 fingerprint，key 模式还要求 fingerprint 匹配当前 key。
 恢复是最终一致的；如果应用第一条指令就依赖该目录，runtime 仍需实现启动门禁或重试。

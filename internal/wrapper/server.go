@@ -158,20 +158,23 @@ func (s *Server) mount(ctx context.Context, token, exportRootKey string, request
 	defer lock.Unlock()
 
 	previous, existed := s.state.Get(key)
+	isExportRoot := node.IsNFSExportRoot(plan)
 	desired := desiredMount{
 		Request:                  request,
-		ExportRootAuthorized:     exportRootKeyFingerprint != "",
+		ExportRootAuthorized:     isExportRoot,
 		ExportRootKeyFingerprint: exportRootKeyFingerprint,
 	}
-	if existed && previous.Request == desired.Request && previous.ExportRootAuthorized != desired.ExportRootAuthorized {
-		return nil, fmt.Errorf("%w: effective NFS export-root policy changed; unmount the existing target first", errBadRequest)
+	if existed && previous.Request != desired.Request {
+		return nil, fmt.Errorf("%w: mount request changed for an existing target; unmount it first", errBadRequest)
 	}
-	if existed && previous.Request == desired.Request &&
-		previous.ExportRootAuthorized && desired.ExportRootAuthorized &&
+	if existed && previous.ExportRootAuthorized != desired.ExportRootAuthorized {
+		return nil, fmt.Errorf("%w: effective NFS export-root selection changed; unmount the existing target first", errBadRequest)
+	}
+	if existed &&
 		previous.ExportRootKeyFingerprint != desired.ExportRootKeyFingerprint {
 		previous.ExportRootKeyFingerprint = desired.ExportRootKeyFingerprint
 		if err := s.state.Put(previous); err != nil {
-			return nil, fmt.Errorf("persist refreshed export-root authorization: %w", err)
+			return nil, fmt.Errorf("persist updated export-root authorization: %w", err)
 		}
 	}
 	if existed && sameMountIntent(previous, desired) && (previous.ContainerID == "" || previous.ContainerID == plan.ContainerID) {

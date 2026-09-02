@@ -99,7 +99,7 @@ metadata:
 ## 安装与配置
 
 ```sh
-go get github.com/silver-chard/kruise-agents-nfs-csi/mounter
+go get github.com/silver-chard/kruise-agents-nfs-csi/mounter@v1.1.1
 ```
 
 创建客户端：
@@ -109,7 +109,7 @@ client, err := mounter.NewClient(mounter.Config{
     DriverName:        "csi.nfs.zhida",
     SocketPath:        "/var/lib/kruise-agents-nfs-csi/wrapper.sock",
     TokenFile:         "/var/run/secrets/kruise-agents-nfs-csi/token",
-    ExportRootKeyFile: "/var/run/secrets/kruise-agents-nfs-csi-root/key", // 仅需 export root 时配置
+    ExportRootKeyFile: "/var/run/secrets/kruise-agents-nfs-csi-root/key", // 仅访问 key-protected root 时配置
     HTTPTimeout:       15 * time.Second,
 })
 ```
@@ -121,7 +121,7 @@ client, err := mounter.NewClient(mounter.Config{
 | `DriverName` | 是 | 必须与 wrapper 配置和 PV CSI driver 一致。 |
 | `SocketPath` | 是 | SDK 容器内可见的 wrapper Unix socket。 |
 | `TokenFile` | 是 | projected service account token 文件。 |
-| `ExportRootKeyFile` | 否 | NFS export root capability key 文件；只在有效 NFS 路径是 share root 时需要。 |
+| `ExportRootKeyFile` | 否 | NFS export root capability key 文件；仅 wrapper 已启用该限制且有效 NFS 路径是 share root 时需要。 |
 | `HTTPTimeout` | 否 | UDS HTTP 请求超时；为 `0` 时默认 15 秒，不能为负数。 |
 | `DisableHTTPTimeout` | 否 | 显式关闭 client 级超时；通常应保持为 `false`，并为每次调用传入有界 context。 |
 
@@ -134,26 +134,31 @@ Pod UID、PV name 和 target path 是否为空。
 `X-Kary-Export-Root-Key` header；`Unmount` 不读取、不发送 key。`Health`
 不读取 token 或 key。
 
-只挂载 share root 以下目录的调用方应让 `ExportRootKeyFile` 保持为空。如需
-export root mount，应把与 wrapper `WRAPPER_EXPORT_ROOT_KEY_FILE` 相同内容的
-Secret 只读挂入 SDK 容器，并把文件路径传给 Config。不要把 key 放进环境变量、
-PV annotation、请求体或日志。wrapper 只在启动时读取 key；轮换 Secret 后需要
-重启 wrapper，SDK 则会在下一次 `Mount` 时重新读取文件。
+只挂载 share root 以下目录的调用方应让 `ExportRootKeyFile` 保持为空。
+wrapper 没有配置 `WRAPPER_EXPORT_ROOT_KEY_FILE` 时，export root mount 也不需要
+客户端 key，但 exact Pod token、实时 Pod、PV annotation、driver、container
+和路径等校验仍然全部生效。wrapper 配置 key 后，需要 root mount 的调用方
+应把相同 Secret 只读挂入 SDK 容器，并把文件路径传给 Config。持有 key
+不会绕过 annotation 或其他校验。不要把 key 放进环境变量、PV annotation、
+请求体或日志。wrapper 只在启动时读取 key；轮换 Secret 后需要重启
+wrapper，SDK 则会在下一次 `Mount` 时重新读取文件。
 
-节点 state 不保存 key 原文，只保存 root 授权标志和 key 的 SHA-256
-fingerprint。轮换并重启 wrapper 后，已有 Linux mount 保持不变，但可信 caller
-需要用新 key 重复相同 `Mount` 来刷新 fingerprint；否则该容器后续重启时不会
-自动恢复旧 key 授权的 export root mount。wrapper 与客户端 Secret 更新期间若
-key 暂时不一致，root mount 会返回 `403`，调用方应在两端一致后重试。
+节点 state v2 的 root 授权标志表示 intent 已通过当时的完整策略。
+annotation-only root mount 也设置该标志，但 fingerprint 为空；key 模式还保存
+key 的 SHA-256 fingerprint，且不保存 key 原文。新增或轮换 key 不会主动卸载
+已有 Linux mount，但无 fingerprint 或 fingerprint 不匹配的 root intent 不会在
+key 模式自动恢复。持有当前 key 的可信 caller 可重复相同 `Mount` 无叠加地升级
+或刷新 state。移除 wrapper key 后，annotation-only 模式可在重新校验时恢复
+已授权 root intent 并清除旧 fingerprint。
 
 ## 有效 NFS 路径与 export root
 
 有效路径由 PV CSI `volumeAttributes["subDir"]`（兼容 `subdir`）与
 `MountRequest.SourceSubPath` 共同决定：
 
-| PV `subDir` | `SourceSubPath` | 有效位置 | 需要 key |
+| PV `subDir` | `SourceSubPath` | 有效位置 | 额外 key 校验 |
 | --- | --- | --- | --- |
-| 空 | 空 | NFS `share` root | 是 |
+| 空 | 空 | NFS `share` root | 仅 wrapper 配置 key 时 |
 | 空 | `users/alice` | `share/users/alice` | 否 |
 | `tenants/team-a` | 空 | `share/tenants/team-a` | 否 |
 | `tenants/team-a` | `workspace` | `share/tenants/team-a/workspace` | 否 |
@@ -161,8 +166,9 @@ key 暂时不一致，root mount 会返回 `403`，调用方应在两端一致�
 PV `subDir` 归一化后为空、仅 `/` 或仅 `.` 都表示 share root；包含 NUL 或
 任意 `..` 路径段会被拒绝。`SourceSubPath` 空或归一化为 `.` 表示 PV root，
 绝对路径、NUL 和 `..` 会被拒绝。只有两者归一化后都为空才是 export root
-mount。SDK 无法在客户端得知 PV `subDir`，因此配置 key 文件后会在每次
-`Mount` 发送 header；wrapper 对非 root mount 忽略它。
+mount，也只有这种情况可能在 wrapper 已配置 key 时触发额外校验。SDK
+无法在客户端得知 PV `subDir`，因此配置 key 文件后会在每次 `Mount`
+发送 header；wrapper 对非 root mount 忽略它。
 
 ## 版本兼容
 
@@ -170,6 +176,10 @@ SDK 会自动发送当前模块实现的 wrapper API 版本，调用方不能覆
 校验该版本，因此 SDK 依赖与节点 wrapper 镜像应来自同一个发布版本或同一 commit，
 并一起升级。`Health` 只检查服务状态，不协商 API 版本；不要单独滚动升级 SDK 后
 长期搭配旧 wrapper 使用。
+
+v1.1.1 仍使用 state v2。v1.1.0 能解析该格式，但会 fail closed 处理 v1.1.1
+写入的 annotation-only root state，因为它没有 key fingerprint；回滚前应由精确
+Pod 身份显式 `Unmount` 这些 intent。
 
 ## 完整示例
 
@@ -354,7 +364,8 @@ API 注入，不应手工伪造。
 `Mount` 会把请求编码为 `POST /v1/mount`，并携带当前
 `TokenFile` 中的 bearer token。配置 `ExportRootKeyFile` 时还会读取 key 并发送
 `X-Kary-Export-Root-Key` header。wrapper 成功完成 exact Pod token、实时
-Pod/PV、PV annotation、driver、目标容器、路径和必要的 export root key 校验，
+Pod/PV、PV annotation、driver、目标容器、路径，以及已启用时的 export root
+key 校验后，
 再完成节点挂载并返回 `MountResult`。PV 是否存在 PVC 或 `claimRef` 不参与授权。
 
 `SourceSubPath` 必须是 PV 内安全的相对目录路径。默认情况下它必须已存在；wrapper
@@ -394,7 +405,7 @@ mount 验证。
 `NewClient` 返回本地配置错误；`Mount` 和 `Unmount` 还可能返回：
 
 - token 文件读取失败或内容为空；
-- export root mount 的 key 文件未配置、读取失败、内容为空或 key 不匹配；
+- 访问 key-protected export root 时，key 文件未配置、读取失败、内容为空或 key 不匹配；
 - wrapper socket 不存在、权限不足或连接失败；
 - context 取消或 HTTP 超时；
 - wrapper 返回的请求格式、TokenReview/exact Pod、Pod/PV annotation、driver、container 或路径校验错误；
@@ -417,10 +428,20 @@ wrapper 返回非 2xx 状态时，SDK 返回 `*mounter.ResponseError`。调用�
 
 SDK 进程不运行 informer，也不保存 node mount 状态。首次 mount 成功后，节点
 wrapper 会把不含 token、export root key 和 NFS 凭据的期望挂载写入节点状态目录；
-export root mount 保存“已通过 root 授权”的布尔值和 authorizing key 的 SHA-256
-fingerprint，不保存 key 原文。目标业务容器获得新的 container ID 时，wrapper
-重新检查实时 Pod、PV driver 和 annotation；只有已登记 root 授权且 fingerprint
-匹配当前 wrapper 启动 key 时，才恢复到新的 mount namespace。
+state v2 中 `export_root_authorized` 表示 root intent 已通过当时的完整策略。
+annotation-only root mount 也记为已授权，但 fingerprint 为空；只有 key
+模式保存 authorizing key 的 SHA-256 fingerprint，不保存 key 原文。
+目标业务容器获得新 container ID 时，wrapper 重新检查实时 Pod、PV
+driver 和 annotation。annotation-only 模式只要 root 授权标志存在就不要求
+fingerprint；key 模式还要求 fingerprint 匹配当前 wrapper key。
+
+旧 state v1 没有 root/非 root 分类，加载后以内存 unknown 标记。目标容器换代
+触发重协调时，wrapper 未配置 key 会按当前 live PV plan 和 policy 补齐分类并可
+恢复；配置 key 且当前 plan 是 export root 时 fail closed，需由精确 Pod 身份
+`Unmount`，再携带有效 key 重新 `Mount`。当前 plan 是非 root 时不需要 key。
+普通 state v2 的同一 target
+若要切换 mount intent 或 root/非 root 分类同样 fail closed，必须先 `Unmount`
+再 `Mount`，不会通过幂等重试改写已登记意图。
 
 恢复是最终一致的。容器创建和 informer 处理完成之间，目标路径可能暂时未挂载。
 需要在应用第一条指令前保证挂载存在时，应由可信 runtime 增加启动门禁或重试。

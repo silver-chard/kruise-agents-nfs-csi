@@ -51,11 +51,11 @@ func loadExportRootAuthorizer(keyFile string) (exportRootAuthorizer, error) {
 }
 
 func (a exportRootAuthorizer) authorize(plan node.MountPlan, providedKey string) (string, error) {
-	if !node.IsNFSExportRoot(plan) {
+	if !node.IsNFSExportRoot(plan) || !a.configured {
 		return "", nil
 	}
 	providedHash := sha256.Sum256([]byte(strings.TrimSpace(providedKey)))
-	if !a.configured || subtle.ConstantTimeCompare(a.keyHash[:], providedHash[:]) != 1 {
+	if subtle.ConstantTimeCompare(a.keyHash[:], providedHash[:]) != 1 {
 		return "", fmt.Errorf("mounting the NFS export root requires a valid export root key")
 	}
 	return a.fingerprint, nil

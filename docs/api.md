@@ -22,23 +22,24 @@ runtime 或 mounter sidecar，不应该直接暴露给不可信业务容器。
 
 ## Wrapper 启动配置
 
-缺失 SourceSubPath 创建策略和 NFS export root key 都属于 wrapper
+缺失 SourceSubPath 创建策略和可选的 NFS export root key 都属于 wrapper
 部署配置，不是 mount JSON 请求字段：
 
 | 环境变量 | Wrapper flag | Helm value | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `WRAPPER_CREATE_MISSING_SUBPATHS` | `--create-missing-subpaths` | `wrapper.createMissingSubPaths` | `false` | 是否逐级创建缺失的 `source_sub_path`。默认关闭，保持原有“目录必须已存在”的行为。 |
 | `WRAPPER_CREATED_SUBPATH_MODE` | `--created-subpath-mode` | `wrapper.createdSubPathMode` | `0770` | 新建每一级目录传给 `mkdirat` 的八进制 mode。实际 mode 仍受进程 umask 和文件系统/NFS default ACL 影响。 |
-| `WRAPPER_EXPORT_ROOT_KEY_FILE` | `--export-root-key-file` | `wrapper.exportRootKeySecret.name` / `key` | 空 | wrapper 侧 NFS export root capability key 文件。不配置时拒绝所有 export root mount，但不影响有效路径位于 root 之下的 mount。 |
+| `WRAPPER_EXPORT_ROOT_KEY_FILE` | `--export-root-key-file` | `wrapper.exportRootKeySecret.name` / `key` | 空 | 可选的 wrapper 侧 NFS export root capability key 文件。不配置时 root mount 只受 annotation 等既有规则限制；配置后 root mount 额外要求相同 key。 |
 
 mode 必须是 `0001` 到 `07777` 范围内的八进制权限字符串；`0000` 或非法值会
 导致 wrapper 启动失败。wrapper 不会为新建或已有目录执行 `chown`，也不会修改
 已有目录的 mode。
 
-export root key 去掉首尾空白后必须是 32 到 4096 个可见 ASCII
-字符（不含空格）。wrapper 启动时读取并保存其 SHA-256 摘要；替换
-文件后需要重启 wrapper 才能生效。不要把 key 写进 PV annotation、
-mount JSON、日志或节点持久化 mount state。
+配置 export root key 时，去掉首尾空白后的内容必须是 32 到 4096 个可见
+ASCII 字符（不含空格）。wrapper 启动时读取并保存其 SHA-256 摘要；替换文件后
+需要重启 wrapper 才能生效。配置文件路径但文件不存在、为空或格式非法会导致
+wrapper 启动失败，而完全不配置表示不启用额外 root-key 限制。不要把 key 写进
+PV annotation、mount JSON、日志或节点持久化 mount state。
 
 ## 调用链路
 
@@ -103,7 +104,7 @@ kruise-nfs-mounter mount \
 | `--pod-uid` | 否 | `POD_UID` 或 `POD_UID_FILE` | 请求 Pod UID。 |
 | `--socket-path` | 否 | `WRAPPER_SOCKET_PATH` 或 `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | wrapper Unix socket 路径。 |
 | `--token-file` | 否 | `PROJECTED_TOKEN_FILE` 或 `/var/run/secrets/kruise-agents-nfs-csi/token` | projected service account token 文件。 |
-| `--export-root-key-file` | 否 | `EXPORT_ROOT_KEY_FILE` 或空 | NFS export root capability key 文件。只有有效 NFS 路径是 export root 时才需要。 |
+| `--export-root-key-file` | 否 | `EXPORT_ROOT_KEY_FILE` 或空 | NFS export root capability key 文件。仅 wrapper 已启用该限制且有效路径是 export root 时需要。 |
 
 成功时 stdout：
 
@@ -146,7 +147,8 @@ kruise-nfs-mounter mount \
 
 只建议在可信 sidecar 或受控排障会话中使用。调用环境仍然需要 wrapper socket 和
 专用 audience 的 Pod-bound projected token。如果该 PV 的有效 NFS 路径是
-export root，还需通过 `--export-root-key-file` 提供 key；非 root 挂载不需要。
+export root，且 wrapper 已配置 root key，还需通过 `--export-root-key-file` 提供
+相同 key；非 root 挂载以及未启用该限制的 wrapper 不需要。
 
 ## Go SDK
 
@@ -189,8 +191,8 @@ SDK 只是现有 mounter 的进程内客户端封装：
 - 仍然需要 wrapper socket、projected token 和 Downward API Pod identity；
 - 所有 mount/unmount 仍由 wrapper 执行 TokenReview，严格匹配 token 绑定的
   Pod name/UID 与实时 Pod；
-- mount 还会检查实时 PV、PV annotation、目标容器、driver、路径和
-  export root key（仅 root 挂载）；
+- mount 还会检查实时 PV、PV annotation、目标容器、driver、路径，以及
+  wrapper 已配置时的 export root key（仅 root 挂载）；key 不绕过其他检查；
 - unmount 不发送 export root key，也不重新核验 PV annotation，只会清理
   该精确 Pod/container/target 已登记的 mount state 和对应 mount；
 - 成功挂载仍由节点 wrapper 持久化期望状态并负责容器重启后的重协调。
@@ -237,10 +239,10 @@ Authorization: Bearer <projected-service-account-token>
 X-Kary-Export-Root-Key: <export-root-key>
 ```
 
-`X-Kary-Export-Root-Key` 仅 export root mount 需要，不是 JSON 字段。
-有效 NFS 路径在 export root 之下时
-应省略它；mounter/SDK 配置了 key 文件时可能仍会发送该 header，
-wrapper 会对非 root mount 忽略它。
+`X-Kary-Export-Root-Key` 不是 JSON 字段；只有 wrapper 配置了 root key 且
+请求有效 NFS export root 时才要求它。有效 NFS 路径在 export root 之下时应
+省略；mounter/SDK 配置了 key 文件时可能仍会发送该 header，wrapper 会对非
+root mount 忽略它。未配置 wrapper key 时，root mount 不依赖该 header。
 
 请求体：
 
@@ -322,8 +324,8 @@ curl --unix-socket /var/lib/kruise-agents-nfs-csi/wrapper.sock \
 unset token
 ```
 
-上例挂载了非空 `source_sub_path`，因此不需要 export root key。调试
-export root mount 时必须额外从文件读取 key 并发送
+上例挂载了非空 `source_sub_path`，因此不需要 export root key。调试已启用
+root-key 限制的 export root mount 时，必须额外从文件读取 key 并发送
 `X-Kary-Export-Root-Key` header。不要把 key 写入 shell history、请求文件或
 日志；正常集成优先使用 CLI 的 `--export-root-key-file` 或 SDK
 `ExportRootKeyFile`。
@@ -364,7 +366,7 @@ wrapper 只有在下面检查全部通过时才会执行 mount：
 | PV ServiceAccount allowlist | PV 存在 `kary.dev/allow-serviceaccount` 时，实时 Pod `spec.serviceAccountName` 必须在 allowlist 中；annotation 缺失时该维度不限制。 |
 | Container | 目标容器必须出现在 Pod status 中，并且 container ID 不能为空。 |
 | NFS source | PV CSI `volumeAttributes` 必须包含 `server` 和 `share`；`subDir` 可选。 |
-| Export root | 归一化后的 PV `subDir` 和请求 `source_sub_path` 都为空时，必须提供与 wrapper 配置一致的 export root key。节点 state 保存授权标志和 key fingerprint；容器重启时必须仍匹配 wrapper 当前 key。 |
+| Export root | 归一化后的 PV `subDir` 和请求 `source_sub_path` 都为空时属于 export root。wrapper 未配置 key 时只执行其他授权规则；配置 key 时必须额外提供相同 key，且 key 不绕过 annotation。state v2 对通过完整策略的 root intent 保存授权标志，并只在 key 模式保存 fingerprint。 |
 | Source subPath | `source_sub_path` 为空时挂整个 PV；不为空时必须是安全的相对目录。默认必须已存在，只有 wrapper 显式开启创建策略后才会创建缺失目录。 |
 | Target path | 目标路径必须是绝对路径，且不能指向敏感系统路径或 secret 路径。 |
 | Existing mount | 如果目标路径已经是 mount point，wrapper 返回错误，不会主动 unmount。 |
@@ -401,9 +403,9 @@ wrapper 使用 PV CSI `volumeAttributes["subDir"]`（兼容小写
 export root 是 PV `server` + `share` 指定的 NFS share root，不是节点或
 NFS server 的文件系统 `/`。
 
-| 归一化 PV `subDir` | 归一化 `source_sub_path` | 有效位置 | 需要 export root key |
+| 归一化 PV `subDir` | 归一化 `source_sub_path` | 有效位置 | 额外 key 校验 |
 | --- | --- | --- | --- |
-| 空 | 空 | `share` root | 是 |
+| 空 | 空 | `share` root | 仅 wrapper 配置 key 时 |
 | 空 | `users/alice` | `share/users/alice` | 否 |
 | `tenants/team-a` | 空 | `share/tenants/team-a` | 否 |
 | `tenants/team-a` | `workspace` | `share/tenants/team-a/workspace` | 否 |
@@ -412,18 +414,36 @@ PV `subDir` 会去掉首尾空白并归一化；空、仅 `/` 或仅 `.` 的路�
 都表示 share root，包含 NUL 或任何 `..` 路径段会被拒绝。
 `source_sub_path` 空或归一化为 `.` 时表示 PV root；绝对路径、NUL 和
 `..` 会被拒绝。只要两者任一归一化后非空，有效路径就在
-export root 之下，不需要 key。
+export root 之下，不使用 key。
 
-wrapper 没有配置 `WRAPPER_EXPORT_ROOT_KEY_FILE` 时默认拒绝 export root
-mount。有效 key 由 mount client 通过 `X-Kary-Export-Root-Key` header
-提供；节点 state 只保存“该 mount 已通过 root 授权”的布尔值和 key 的 SHA-256
-fingerprint，不保存 key 原文、header、token 或可重放凭据。旧 state v1 没有
-这些授权信息，因此不会在容器重启后把历史 root mount 自动恢复为已授权。
+wrapper 没有配置 `WRAPPER_EXPORT_ROOT_KEY_FILE` 时，export root mount 只受
+exact Pod token、实时 Pod、PV annotation、driver、container 和路径等既有规则
+限制。配置 key 后，mount client 必须通过 `X-Kary-Export-Root-Key` header 提供
+相同值；持有 key 仍不能绕过 annotation 或任何其他检查。
+
+state v2 的 `export_root_authorized` 表示 root intent 已通过当时的完整策略。
+annotation-only root mount 也设置该标志，但 fingerprint 为空；key 模式还保存
+authorizing key 的 SHA-256 fingerprint。state 不保存 key 原文、header、token
+或可重放凭据。旧 state v2 可以直接复用。state v1 没有 root/非 root 分类，加载
+后以内存 unknown 标记：目标容器换代触发重协调时，wrapper 未配置 key 会按当前
+live PV plan 和 policy 补齐分类并可恢复；wrapper 配置 key 且当前 plan 是
+export root 时 fail closed，需由精确 Pod 身份 `Unmount` 后再携带有效 key 重新
+`Mount`。当前 plan 为非 root 时不需要 key。
 
 wrapper 只在启动时读取 key，而 SDK/mounter 每次 mount 都读取客户端 key 文件。
-轮换后必须重启 wrapper 并协调两端 Secret。已有 Linux mount 不会被主动卸载；
-可信 caller 可用新 key 重复相同 mount 请求来刷新 state fingerprint。未刷新时，
-该容器后续重启不会自动恢复旧 key 授权的 export root mount。
+新增或轮换 key 后，旧的无 fingerprint 或旧 fingerprint root intent 不会在 key
+模式自动恢复；持有当前 key 的可信 caller 可重复相同 mount 请求，无叠加地升级
+或刷新 state。移除 wrapper key 后，annotation-only 模式可以在重新校验现有规则
+后恢复 root intent，并清除旧 fingerprint。模式或 key 变化都不会主动卸载已有
+Linux mount。
+
+普通 state v2 的同一 target 若要切换 mount intent 或 root/非 root 分类，会 fail
+closed，必须先 `Unmount` 再 `Mount`；幂等重复请求只用于刷新完全相同的已登记
+intent。
+
+v1.1.1 继续写 state v2，v1.1.0 可以解析该格式，但会把“已授权且 fingerprint
+为空”的 annotation-only root state 作为 fail closed 处理，并可能在重协调时
+清理它。回滚到 v1.1.0 前应显式 unmount 这类 intent。
 
 ## Source SubPath 规则
 
@@ -436,8 +456,8 @@ wrapper 只在启动时读取 key，而 SDK/mounter 每次 mount 都读取客户
 - 任意已有路径组件是 symlink；
 - 任意已有路径组件不是目录。
 
-空值表示挂载整个 PV；如果 PV `subDir` 也归一化为空，这是
-export root mount，还必须通过 root key 鉴权。当前只支持目录 subPath，
+空值表示挂载整个 PV；如果 PV `subDir` 也归一化为空，这是 export root mount，
+并在 wrapper 已配置 key 时额外通过 root key 鉴权。当前只支持目录 subPath，
 不支持文件 subPath。默认配置
 `WRAPPER_CREATE_MISSING_SUBPATHS=false` 下，任意组件不存在也会被拒绝。
 
@@ -478,18 +498,18 @@ mounter sidecar 或 SDK 调用方需要：
   `serviceAccountToken` projected volume 签发的 `PROJECTED_TOKEN_FILE`；TokenReview
   必须能返回与当前 Pod 一致的 bound Pod name/UID extra；
 - 来自 Downward API 环境变量或 projected 文件的 Pod namespace、name 和 UID；
-- 只在需要 export root mount 时挂载与 wrapper 配置一致的 key 文件，
-  并为 CLI 设置 `EXPORT_ROOT_KEY_FILE` / `--export-root-key-file`，或为 SDK
-  设置 `Config.ExportRootKeyFile`；
+- 只在 wrapper 已启用 root-key 限制且调用方需要 export root mount 时挂载相同
+  key 文件，并为 CLI 设置 `EXPORT_ROOT_KEY_FILE` / `--export-root-key-file`，或
+  为 SDK 设置 `Config.ExportRootKeyFile`；
 - 非 privileged，且不需要 `SYS_ADMIN`。
 
 wrapper DaemonSet 需要：
 
 - 相同的 `DRIVER_NAME`；
 - 相同的 `TOKEN_AUDIENCE`；
-- 如需允许 export root mount，使用 `WRAPPER_EXPORT_ROOT_KEY_FILE` /
-  `--export-root-key-file` 或 Helm `wrapper.exportRootKeySecret` 挂载 key；不配置则
-  fail closed，但非 root mount 照常工作；
+- 如需为 export root 增加共享 key 限制，使用 `WRAPPER_EXPORT_ROOT_KEY_FILE` /
+  `--export-root-key-file` 或 Helm `wrapper.exportRootKeySecret` 挂载 key；不配置
+  表示 root mount 只受 annotation 等既有规则限制；
 - host 上的 wrapper state 目录和 kubelet pod 目录；
 - `WRAPPER_MOUNT_STATE_DIR` 必须持久化到节点，并且只允许 wrapper 写入；
 - 如需自动创建缺失 subPath，显式设置
@@ -524,7 +544,7 @@ wrapper 环境变量：
 | `WRAPPER_REQUEST_TIMEOUT` | `30s` | Kubernetes 与 mount 操作的单请求超时。 |
 | `WRAPPER_CREATE_MISSING_SUBPATHS` | `false` | 是否逐级创建缺失的 `source_sub_path`。 |
 | `WRAPPER_CREATED_SUBPATH_MODE` | `0770` | 创建缺失 subPath 时请求的八进制 mode。 |
-| `WRAPPER_EXPORT_ROOT_KEY_FILE` | 空 | wrapper 侧 export root key 文件。空值表示拒绝所有 export root mount。 |
+| `WRAPPER_EXPORT_ROOT_KEY_FILE` | 空 | 可选 wrapper 侧 export root key 文件。空值表示不增加 root-key 检查；其他授权规则仍然生效。 |
 
 mounter 环境变量：
 
@@ -533,7 +553,7 @@ mounter 环境变量：
 | `DRIVER_NAME` | `csi.nfs.zhida` | 请求中发送的 driver name。 |
 | `WRAPPER_SOCKET_PATH` | `/var/lib/kruise-agents-nfs-csi/wrapper.sock` | wrapper UDS 路径。 |
 | `PROJECTED_TOKEN_FILE` | `/var/run/secrets/kruise-agents-nfs-csi/token` | projected service account token。 |
-| `EXPORT_ROOT_KEY_FILE` | 空 | 可选 export root key 文件；不需要 root mount 的 caller 应保持为空。 |
+| `EXPORT_ROOT_KEY_FILE` | 空 | 可选 export root key 文件；仅需要访问 key-protected export root 的 caller 配置。 |
 | `POD_NAMESPACE` | 空 | Pod namespace。 |
 | `POD_NAME` | 空 | Pod name。 |
 | `POD_UID` | 空 | Pod UID。 |

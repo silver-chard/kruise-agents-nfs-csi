@@ -14,6 +14,19 @@ the CSI socket.
 The default CSI driver name is `csi.nfs.zhida`. Set the same `DRIVER_NAME` in
 the wrapper and mounter when a deployment uses a different name.
 
+## What's new in v1.1.1
+
+- The NFS export-root capability key is now an optional extra restriction.
+  Without a wrapper key, root mounts use the same exact-Pod, PV annotation,
+  driver, container, and path checks as other mounts. With a wrapper key, a
+  root mount must additionally present the same key.
+- The key never bypasses `kary.dev/allow-namespace` or
+  `kary.dev/allow-serviceaccount`; all configured authorization checks remain
+  cumulative.
+- Desired-mount state remains format v2. A v1.1.0 rollback can read it, but
+  treats v1.1.1 annotation-only root state (authorized with no fingerprint) as
+  fail closed; explicitly unmount those intents before downgrading.
+
 ## What's new in v1.1.0
 
 - Dynamic mounts no longer require a PVC or use the PV `claimRef` as an
@@ -21,8 +34,8 @@ the wrapper and mounter when a deployment uses a different name.
   namespace and service-account annotation allowlists.
 - Projected service account tokens must be bound to the exact target Pod name
   and UID, in addition to matching the configured audience.
-- Mounting an effective NFS export root requires an optional startup capability
-  key. The key is sent only over the wrapper UDS and is never persisted.
+- An export-root startup capability key and corresponding reconciliation state
+  were added. The key is sent only over the wrapper UDS and is never persisted.
 - Desired-mount state now preserves export-root authorization safely across
   container restarts, and unmount avoids touching an unregistered or replaced
   container target.
@@ -53,8 +66,9 @@ staging source (`WRAPPER_UNSTAGE_AFTER_MOUNT=true`). Successful mounts are
 stored as root-only node state without bearer tokens or NFS credentials. If a
 container ID changes for the same Pod UID, a node-filtered informer triggers
 live revalidation and restores the mount in the replacement namespace. State
-format v2 records whether an NFS export-root mount was authorized and the
-SHA-256 fingerprint of the authorizing key; the key itself is never persisted.
+format v2 records whether an export-root intent passed the policy in effect at
+mount time and, when root-key protection was active, the SHA-256 fingerprint of
+the authorizing key; the key itself is never persisted.
 
 ## Prerequisites
 
@@ -155,7 +169,7 @@ result, err := client.Mount(ctx, mounter.MountRequest{
 Install the SDK with:
 
 ```sh
-go get github.com/silver-chard/kruise-agents-nfs-csi/mounter@v1.1.0
+go get github.com/silver-chard/kruise-agents-nfs-csi/mounter@v1.1.1
 ```
 
 The SDK uses the same UDS protocol, token rotation behavior, validation, and
@@ -202,11 +216,12 @@ subsequently revoked that Pod.
 ## NFS export-root capability
 
 The effective NFS source is the export root only when both the PV CSI `subDir`
-and request `source_sub_path` normalize to empty. That operation requires the
-wrapper's export-root capability key. A PV with a non-empty `subDir` already
-represents a directory below the NFS export, so mounting that PV's root does not
-require the key. A non-empty request `source_sub_path` likewise selects a path
-below the export and does not require it.
+and request `source_sub_path` normalize to empty. If the wrapper is configured
+with an export-root capability key, that operation must additionally present
+the same key. A PV with a non-empty `subDir` already represents a directory
+below the NFS export, so mounting that PV's root does not use the key. A
+non-empty request `source_sub_path` likewise selects a path below the export and
+does not use it.
 
 This boundary is lexical and assumes the PV and NFS namespace are trusted. The
 wrapper evaluates the PV's `server`, `share`, and normalized `subDir`; it cannot
@@ -217,7 +232,7 @@ namespace must therefore be treated as a storage administrator. Here,
 NFS server's filesystem `/`. To request the PV root, leave `source_sub_path`
 empty; `/` remains invalid because request subpaths must be relative.
 
-Configure the wrapper with a key file at startup:
+Optionally configure the wrapper with a key file at startup:
 
 ```sh
 WRAPPER_EXPORT_ROOT_KEY_FILE=/var/run/secrets/kruise-agents-nfs-csi-export-root/key
@@ -228,8 +243,11 @@ kruise-nfs-wrapper --export-root-key-file=/var/run/secrets/kruise-agents-nfs-csi
 The trimmed key must contain 32 through 4096 visible ASCII characters; use a
 random value rather than a human-readable password. The wrapper reads and
 hashes it at startup; rotating the file therefore requires a wrapper restart.
-If no wrapper key file is configured, all export-root mount requests are
-denied.
+If no wrapper key file is configured, there is no additional root-key check:
+export-root mounts are still subject to the exact-Pod token, live Pod, PV
+namespace/service-account annotations, driver, container, and path checks. If a
+key is configured, an export-root request with a missing or different key is
+denied. Possession of the key never bypasses any of the other checks.
 
 Clients that are intentionally allowed to mount the export root configure the
 same value as a file, rather than placing it in command arguments or request
@@ -256,13 +274,27 @@ mounter.Config{
 The mounter and SDK read the file for each mount request and send the key only
 in the `X-Kary-Export-Root-Key` HTTP header over the Unix socket. They do not
 send it for unmount. The key is not a mount request JSON field and is never
-written to desired-mount state. State v2 persists an
-`export_root_authorized` boolean and the key's SHA-256 fingerprint.
-Reconciliation of an export-root mount requires that fingerprint to match the
-wrapper's current startup key. After rotating the key and restarting the
-wrapper, an existing mount remains mounted, but its automatic remount is
-disabled until a trusted caller repeats `Mount` with the new key; an idempotent
-call refreshes the fingerprint without stacking another mount.
+written to desired-mount state. State v2 marks a root intent authorized after
+the complete policy succeeds. Annotation-only root mounts have no fingerprint;
+key-protected root mounts additionally save the key's SHA-256 fingerprint. In
+key-protected mode, reconciliation requires a matching current fingerprint, so
+an older annotation-only root intent is not restored. A trusted caller holding
+the current key can repeat the same `Mount` to upgrade or refresh state without
+stacking another mount. Removing the wrapper key switches to annotation-only
+mode, in which an authorized root intent can be restored and its stale
+fingerprint is cleared. Adding, rotating, or removing the key never actively
+unmounts an existing Linux mount.
+
+Legacy state v1 has no root/non-root classification and is loaded as unknown.
+When a replacement container triggers reconciliation, a wrapper without a key
+uses the current live PV plan and policy to backfill that classification and
+may restore the intent. With a wrapper key, a legacy intent whose live plan is
+the export root fails closed; use exact-Pod `Unmount`, then issue a new `Mount`
+with the valid key. A legacy non-root plan does not need the key. For ordinary
+v2 state, changing the mount intent or
+root/non-root classification for the same target always requires `Unmount`
+followed by `Mount`; an idempotent repeat only refreshes the same registered
+intent.
 
 The Helm chart consumes an existing Secret; it does not generate one:
 
@@ -273,11 +305,15 @@ wrapper:
     key: export-root-key
 ```
 
-The named Secret must exist in the chart release namespace before installation
-or upgrade. Its selected value is mounted read-only into the wrapper with mode
-`0400`. A trusted mounter that needs this capability must separately mount the
-same Secret and set `EXPORT_ROOT_KEY_FILE`; clients that only mount NFS
-subdirectories should not receive it.
+The named Secret must exist in the wrapper DaemonSet namespace before
+installation or upgrade. This is the Helm release namespace unless the chart's
+`namespace` value overrides it. The chart does not read a Secret from another
+namespace and does not create one. Its selected value is mounted read-only into
+the wrapper with mode `0400`. Leaving `name` empty mounts no key and enables
+annotation-only root authorization. When a name is set, a trusted mounter that
+needs root access must separately mount the same Secret and set
+`EXPORT_ROOT_KEY_FILE`; clients that only mount NFS subdirectories should not
+receive it.
 
 ## Optional creation of a missing SourceSubPath
 

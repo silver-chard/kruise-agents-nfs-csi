@@ -10,7 +10,10 @@ import (
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/node"
 )
 
-var errDesiredMountStale = errors.New("desired mount is stale")
+var (
+	errDesiredMountStale        = errors.New("desired mount is stale")
+	errDesiredMountUnauthorized = errors.New("desired mount is not authorized by the current policy")
+)
 
 const podWatchQueueSize = 1024
 const reconcileRetryQueueSize = 4096
@@ -126,7 +129,7 @@ func (s *Server) reconcilePodEvent(ctx context.Context, event kube.PodWatchEvent
 }
 
 func (s *Server) scheduleReconcileRetry(ctx context.Context, retries chan<- reconcileRetry, desired desiredMount, err error) {
-	if err == nil || errors.Is(err, errDesiredMountStale) || ctx.Err() != nil {
+	if err == nil || errors.Is(err, errDesiredMountStale) || errors.Is(err, errDesiredMountUnauthorized) || ctx.Err() != nil {
 		return
 	}
 	key := desired.key()
@@ -161,7 +164,7 @@ func (s *Server) processReconcileRetries(ctx context.Context, retries chan recon
 			err := s.reconcileMount(requestCtx, desired)
 			cancel()
 			s.handleReconcileResult(desired, err)
-			if err == nil || errors.Is(err, errDesiredMountStale) || retry.attempt+1 >= len(reconcileRetryDelays) {
+			if err == nil || errors.Is(err, errDesiredMountStale) || errors.Is(err, errDesiredMountUnauthorized) || retry.attempt+1 >= len(reconcileRetryDelays) {
 				s.retrying.Delete(retry.key)
 				continue
 			}
@@ -302,12 +305,22 @@ func (s *Server) reconcileMountForPod(ctx context.Context, snapshot desiredMount
 		return err
 	}
 	current.Request = request
-	if node.IsNFSExportRoot(plan) &&
-		(!current.ExportRootAuthorized || !s.exportRoot.authorizesFingerprint(current.ExportRootKeyFingerprint)) {
-		return fmt.Errorf("%w: desired mount has no authorization from the current NFS export root key", errDesiredMountStale)
+	isExportRoot := node.IsNFSExportRoot(plan)
+	if current.legacyRootClassificationUnknown {
+		if isExportRoot && s.exportRoot.configured {
+			return fmt.Errorf("%w: legacy desired mount has no authorization from the current NFS export root key", errDesiredMountUnauthorized)
+		}
+		current.ExportRootAuthorized = isExportRoot
+		current.ExportRootKeyFingerprint = ""
+		current.legacyRootClassificationUnknown = false
+	} else if current.ExportRootAuthorized != isExportRoot {
+		return fmt.Errorf("%w: effective NFS export-root selection differs from the persisted mount", errDesiredMountUnauthorized)
 	}
-	if !node.IsNFSExportRoot(plan) {
-		current.ExportRootAuthorized = false
+	if isExportRoot && s.exportRoot.configured &&
+		!s.exportRoot.authorizesFingerprint(current.ExportRootKeyFingerprint) {
+		return fmt.Errorf("%w: desired mount has no authorization from the current NFS export root key", errDesiredMountUnauthorized)
+	}
+	if !isExportRoot || !s.exportRoot.configured {
 		current.ExportRootKeyFingerprint = ""
 	}
 

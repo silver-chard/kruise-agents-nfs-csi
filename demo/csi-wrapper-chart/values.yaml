@@ -8,7 +8,7 @@ wrapper:
   image:
     # Build and publish this image before deploying the demo.
     repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
-    tag: v1.1.0
+    tag: v1.1.1
     pullPolicy: IfNotPresent
   socketHostPath: /var/lib/kruise-agents-nfs-csi
   stagingHostPath: /var/lib/kruise-agents-nfs-csi/staging
@@ -33,7 +33,7 @@ csi-driver-nfs:
     nfs:
       image:
         repository: ghcr.io/example/kruise-agents-nfs-csi-wrapper
-        tag: v1.1.0
+        tag: v1.1.1
         pullPolicy: IfNotPresent
       env:
         - name: DRIVER_NAME
