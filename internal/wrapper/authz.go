@@ -193,7 +193,6 @@ func sandboxMainContainerName(pod *kube.Pod) string {
 }
 
 func buildMountPlan(request api.MountRequest, pod *kube.Pod, pv *kube.PersistentVolume, containerID string) (node.MountPlan, error) {
-	driver := pv.Spec.CSI.Driver
 	attrs := pv.Spec.CSI.VolumeAttributes
 	server := firstNonEmpty(attrs["server"], attrs["mountOptions.server"])
 	share := firstNonEmpty(attrs["share"], attrs["mountOptions.share"])
@@ -201,21 +200,11 @@ func buildMountPlan(request api.MountRequest, pod *kube.Pod, pv *kube.Persistent
 	if err != nil {
 		return node.MountPlan{}, fmt.Errorf("pv %s has invalid nfs subDir: %w", pv.Metadata.Name, err)
 	}
-	if driver != node.JuiceFSDriver && (server == "" || share == "") {
+	if server == "" || share == "" {
 		return node.MountPlan{}, fmt.Errorf("pv %s is missing nfs server/share volume attributes", pv.Metadata.Name)
 	}
-	secrets := map[string]string{}
-	plan := node.MountPlan{
-		PodNamespace:   pod.Metadata.Namespace,
-		PodName:        pod.Metadata.Name,
-		ServiceAccount: pod.Spec.ServiceAccountName,
-		ReadOnly:       request.ReadOnly,
+	return node.MountPlan{
 		PV: node.PersistentVolume{
-			ReadOnly:     pv.Spec.CSI.ReadOnly,
-			Driver:       driver,
-			FSType:       pv.Spec.CSI.FSType,
-			Attributes:   attrs,
-			Secrets:      secrets,
 			Name:         pv.Metadata.Name,
 			VolumeHandle: pv.Spec.CSI.VolumeHandle,
 			Server:       server,
@@ -228,11 +217,7 @@ func buildMountPlan(request api.MountRequest, pod *kube.Pod, pv *kube.Persistent
 		ContainerID:   containerID,
 		SourceSubPath: request.SourceSubPath,
 		TargetPath:    request.TargetPath,
-	}
-	if driver == node.JuiceFSDriver && !request.ReadOnly && node.JuiceFSSourceReadOnly(plan.PV) {
-		return node.MountPlan{}, fmt.Errorf("JuiceFS pv %s is configured read-only; cannot grant a writable target", pv.Metadata.Name)
-	}
-	return plan, nil
+	}, nil
 }
 
 func firstNonEmpty(values ...string) string {

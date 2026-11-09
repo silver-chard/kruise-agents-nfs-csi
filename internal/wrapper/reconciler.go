@@ -11,9 +11,8 @@ import (
 )
 
 var (
-	errDesiredMountStale          = errors.New("desired mount is stale")
-	errDesiredMountUnauthorized   = errors.New("desired mount is not authorized by the current policy")
-	errDesiredMountSourceReleased = errors.New("desired mount source was already released")
+	errDesiredMountStale        = errors.New("desired mount is stale")
+	errDesiredMountUnauthorized = errors.New("desired mount is not authorized by the current policy")
 )
 
 const podWatchQueueSize = 1024
@@ -84,7 +83,7 @@ func (s *Server) reconcilePodSnapshot(ctx context.Context, pods []kube.Pod, retr
 	for _, desired := range s.state.List() {
 		pod := podsByUID[desired.Request.Namespace+"\x00"+desired.Request.PodName+"\x00"+desired.Request.PodUID]
 		if pod == nil {
-			requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+			requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 			livePod, err := s.kube.GetPod(requestCtx, desired.Request.Namespace, desired.Request.PodName)
 			if err == nil && livePod.Spec.NodeName != "" && livePod.Spec.NodeName != s.cfg.NodeName {
 				err = fmt.Errorf("%w: pod %s/%s moved away from node %s", errDesiredMountStale, desired.Request.Namespace, desired.Request.PodName, s.cfg.NodeName)
@@ -100,7 +99,7 @@ func (s *Server) reconcilePodSnapshot(ctx context.Context, pods []kube.Pod, retr
 			s.scheduleReconcileRetry(ctx, retries, desired, err)
 			continue
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+		requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		err := s.reconcileMountForPod(requestCtx, desired, pod)
 		cancel()
 		s.handleReconcileResult(desired, err)
@@ -116,14 +115,10 @@ func (s *Server) reconcilePodEvent(ctx context.Context, event kube.PodWatchEvent
 	}
 	for _, desired := range s.state.ListForPod(podKey) {
 		if event.Type == "DELETED" {
-			err := fmt.Errorf("%w: pod %s/%s was deleted", errDesiredMountStale, desired.Request.Namespace, desired.Request.PodName)
-			s.handleReconcileResult(desired, err)
-			if len(retries) != 0 {
-				s.scheduleReconcileRetry(ctx, retries[0], desired, err)
-			}
+			s.handleReconcileResult(desired, fmt.Errorf("%w: pod %s/%s was deleted", errDesiredMountStale, desired.Request.Namespace, desired.Request.PodName))
 			continue
 		}
-		requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+		requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		err := s.reconcileMountForPod(requestCtx, desired, &event.Pod)
 		cancel()
 		s.handleReconcileResult(desired, err)
@@ -134,10 +129,7 @@ func (s *Server) reconcilePodEvent(ctx context.Context, event kube.PodWatchEvent
 }
 
 func (s *Server) scheduleReconcileRetry(ctx context.Context, retries chan<- reconcileRetry, desired desiredMount, err error) {
-	if !shouldRetryReconcile(err) || ctx.Err() != nil {
-		return
-	}
-	if _, exists := s.state.Get(desired.key()); !exists {
+	if err == nil || errors.Is(err, errDesiredMountStale) || errors.Is(err, errDesiredMountUnauthorized) || ctx.Err() != nil {
 		return
 	}
 	key := desired.key()
@@ -168,11 +160,11 @@ func (s *Server) processReconcileRetries(ctx context.Context, retries chan recon
 				s.retrying.Delete(retry.key)
 				continue
 			}
-			requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+			requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 			err := s.reconcileMount(requestCtx, desired)
 			cancel()
 			s.handleReconcileResult(desired, err)
-			if !shouldRetryReconcile(err) || retry.attempt+1 >= len(reconcileRetryDelays) {
+			if err == nil || errors.Is(err, errDesiredMountStale) || errors.Is(err, errDesiredMountUnauthorized) || retry.attempt+1 >= len(reconcileRetryDelays) {
 				s.retrying.Delete(retry.key)
 				continue
 			}
@@ -214,7 +206,7 @@ func (s *Server) reconcileAll(ctx context.Context) {
 		podKey := desired.Request.Namespace + "\x00" + desired.Request.PodName + "\x00" + desired.Request.PodUID
 		podState, cached := pods[podKey]
 		if !cached {
-			requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+			requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 			pod, err := s.kube.GetPod(requestCtx, desired.Request.Namespace, desired.Request.PodName)
 			cancel()
 			if err != nil {
@@ -228,7 +220,7 @@ func (s *Server) reconcileAll(ctx context.Context) {
 			pods[podKey] = podState
 		}
 
-		requestCtx, cancel := context.WithTimeout(ctx, s.operationTimeout(desired.Request.DriverName))
+		requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		err := podState.err
 		if err == nil {
 			err = s.reconcileMountForPod(requestCtx, desired, podState.pod)
@@ -250,14 +242,7 @@ func (s *Server) handleReconcileResult(desired desiredMount, err error) {
 		current, exists := s.state.Get(key)
 		var deleteErr error
 		if exists && current == desired {
-			if !errors.Is(err, errDesiredMountSourceReleased) {
-				ctx, cancel := context.WithTimeout(context.Background(), s.operationTimeout(desired.Request.DriverName))
-				deleteErr = s.releaseSource(ctx, desired.Request)
-				cancel()
-			}
-			if deleteErr == nil {
-				deleteErr = s.state.Delete(key)
-			}
+			deleteErr = s.state.Delete(key)
 		}
 		lock.Unlock()
 		if deleteErr == nil && exists && current == desired {
@@ -272,18 +257,6 @@ func (s *Server) handleReconcileResult(desired desiredMount, err error) {
 		err = errors.Join(err, fmt.Errorf("delete stale desired mount: %w", deleteErr))
 	}
 	s.logReconcileError(key, desired, err)
-}
-
-func shouldRetryReconcile(err error) bool {
-	if err == nil || errors.Is(err, errDesiredMountUnauthorized) {
-		return false
-	}
-	if errors.Is(err, errDesiredMountStale) {
-		// A clean stale cleanup deletes state in handleReconcileResult. If state
-		// still exists, cleanup failed and needs a bounded retry.
-		return true
-	}
-	return true
 }
 
 func (s *Server) reconcileMount(ctx context.Context, snapshot desiredMount) error {
@@ -323,28 +296,7 @@ func (s *Server) reconcileMountForPod(ctx context.Context, snapshot desiredMount
 	}
 	request.ContainerName = containerStatus.Name
 	current.Request = request
-	if request.DriverName == node.JuiceFSDriver {
-		// Authorization is a revocable Manager grant. Once withdrawn, remove
-		// the desired state and release the source instead of keeping a stale
-		// mount alive forever. Other errors (PV/Secret/API) remain retryable.
-		if err := authorizeJuiceFSMount(pod, request); err != nil {
-			// The Pod still exists: detach its bind before releasing the last
-			// source reference. Otherwise its namespace retains a stale FUSE
-			// bind after CSI unpublishes the source.
-			if current.ContainerID != "" && current.ContainerID == containerStatus.ContainerID {
-				plan := node.MountPlan{PV: node.PersistentVolume{Name: request.PVName, Driver: request.DriverName}, PodUID: request.PodUID, ContainerName: request.ContainerName, ContainerID: containerStatus.ContainerID, SourceSubPath: request.SourceSubPath, TargetPath: request.TargetPath, ReadOnly: request.ReadOnly}
-				if unmountErr := s.mounter.Unmount(ctx, plan); unmountErr != nil {
-					return fmt.Errorf("detach revoked JuiceFS mount: %w", unmountErr)
-				}
-				return fmt.Errorf("%w: %w: %v", errDesiredMountStale, errDesiredMountSourceReleased, err)
-			}
-			return fmt.Errorf("%w: %v", errDesiredMountStale, err)
-		}
-	}
-	// JuiceFS also validates the operator-owned source lease and target identity
-	// on every reconcile; a CSI/FUSE restart must not be hidden by a stale
-	// ContainerID-only fast path. NFS keeps the historical cheap path.
-	if current.ContainerID != "" && current.ContainerID == containerStatus.ContainerID && request.DriverName != node.JuiceFSDriver {
+	if current.ContainerID != "" && current.ContainerID == containerStatus.ContainerID {
 		return nil
 	}
 
@@ -389,10 +341,6 @@ func (s *Server) reconcileMountForPod(ctx context.Context, snapshot desiredMount
 	}
 
 	if err := s.mounter.Mount(ctx, plan); err != nil {
-		if errors.Is(err, node.ErrMountCleanupPending) {
-			current.ContainerID = plan.ContainerID
-			return errors.Join(err, s.state.Put(current))
-		}
 		return err
 	}
 	previousContainerID := current.ContainerID

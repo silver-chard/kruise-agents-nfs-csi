@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/config"
@@ -102,7 +101,7 @@ func (s *Server) handleMount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.operationTimeout(request.DriverName))
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
 	defer cancel()
 
 	result, err := s.mount(ctx, token, r.Header.Get(api.ExportRootKeyHeader), request)
@@ -133,7 +132,7 @@ func (s *Server) handleUnmount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.operationTimeout(request.DriverName))
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
 	defer cancel()
 
 	result, err := s.unmount(ctx, token, request)
@@ -198,12 +197,6 @@ func (s *Server) mount(ctx context.Context, token, exportRootKey string, request
 		return nil, fmt.Errorf("persist desired mount: %w", err)
 	}
 	if err := s.mounter.Mount(ctx, plan); err != nil {
-		if errors.Is(err, node.ErrMountCleanupPending) {
-			// The failed injection still owns an attached target. Preserve the
-			// exact container so explicit unmount and grant revocation can retry.
-			desired.ContainerID = plan.ContainerID
-			return nil, errors.Join(errNodeOperation, err, s.state.Put(desired))
-		}
 		return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
 	}
 	desired.ContainerID = plan.ContainerID
@@ -218,8 +211,7 @@ func (s *Server) mount(ctx context.Context, token, exportRootKey string, request
 func mountResult(driverName string, request api.MountRequest) *api.MountResult {
 	return &api.MountResult{
 		Mounted:       true,
-		DriverName:    request.DriverName,
-		ReadOnly:      request.ReadOnly,
+		DriverName:    driverName,
 		PVName:        request.PVName,
 		SourceSubPath: request.SourceSubPath,
 		TargetPath:    request.TargetPath,
@@ -260,57 +252,44 @@ func (s *Server) unmount(ctx context.Context, token string, request api.UnmountR
 	if !existed {
 		return &api.UnmountResult{
 			Unmounted:     true,
-			DriverName:    mountRequest.DriverName,
+			DriverName:    s.cfg.DriverName,
 			PVName:        mountRequest.PVName,
 			TargetPath:    mountRequest.TargetPath,
 			ContainerName: mountRequest.ContainerName,
 		}, nil
 	}
-	if previous.Request.PVName != mountRequest.PVName || previous.Request.DriverName != mountRequest.DriverName {
+	if previous.Request.PVName != mountRequest.PVName {
 		return nil, fmt.Errorf("%w: target path %s is registered for pv %s", errBadRequest, mountRequest.TargetPath, previous.Request.PVName)
 	}
 	if previous.ContainerID == "" || previous.ContainerID != containerStatus.ContainerID {
-		if err := s.releaseSource(ctx, previous.Request); err != nil {
-			return nil, err
-		}
 		if err := s.state.Delete(key); err != nil {
 			return nil, fmt.Errorf("delete stale desired mount: %w", err)
 		}
 		s.logger.Printf("removed stale desired mount for pv %s pod %s/%s container %s at %s without touching container %s", mountRequest.PVName, mountRequest.Namespace, mountRequest.PodName, mountRequest.ContainerName, mountRequest.TargetPath, safeContainerID(containerStatus.ContainerID))
 		return &api.UnmountResult{
 			Unmounted:     true,
-			DriverName:    mountRequest.DriverName,
+			DriverName:    s.cfg.DriverName,
 			PVName:        mountRequest.PVName,
 			TargetPath:    mountRequest.TargetPath,
 			ContainerName: mountRequest.ContainerName,
 		}, nil
 	}
 	plan := node.MountPlan{
-		PV:            node.PersistentVolume{Name: mountRequest.PVName, Driver: previous.Request.DriverName},
+		PV:            node.PersistentVolume{Name: mountRequest.PVName},
 		PodUID:        pod.Metadata.UID,
 		ContainerName: containerStatus.Name,
 		ContainerID:   containerStatus.ContainerID,
 		TargetPath:    mountRequest.TargetPath,
-		SourceSubPath: previous.Request.SourceSubPath,
-		ReadOnly:      previous.Request.ReadOnly,
 	}
 	if err := s.state.Delete(key); err != nil {
 		return nil, fmt.Errorf("delete desired mount: %w", err)
 	}
-	// A JuiceFS target with an unexpected mode or a dead FUSE source still
-	// needs detaching. Health checks must not turn that into source-only cleanup.
-	if plan.PV.Driver == node.JuiceFSDriver {
-		if err := s.mounter.Unmount(ctx, plan); err != nil {
-			return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
-		}
-	} else if mounted, err := s.mounter.IsMounted(ctx, plan); err != nil {
+	mounted, err := s.mounter.IsMounted(ctx, plan)
+	if err != nil {
 		return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
-	} else if mounted {
+	}
+	if mounted {
 		if err := s.mounter.Unmount(ctx, plan); err != nil {
-			return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
-		}
-	} else {
-		if err := s.releaseSource(ctx, previous.Request); err != nil {
 			return nil, errors.Join(errNodeOperation, err, s.restoreDesiredMount(key, previous, existed))
 		}
 	}
@@ -318,7 +297,7 @@ func (s *Server) unmount(ctx context.Context, token string, request api.UnmountR
 	s.logger.Printf("unmounted pv %s for pod %s/%s container %s at %s", mountRequest.PVName, mountRequest.Namespace, mountRequest.PodName, mountRequest.ContainerName, mountRequest.TargetPath)
 	return &api.UnmountResult{
 		Unmounted:     true,
-		DriverName:    mountRequest.DriverName,
+		DriverName:    s.cfg.DriverName,
 		PVName:        mountRequest.PVName,
 		TargetPath:    mountRequest.TargetPath,
 		ContainerName: mountRequest.ContainerName,
@@ -384,11 +363,7 @@ func (s *Server) authorizedPodForRequest(ctx context.Context, token string, requ
 }
 
 func (s *Server) normalizeMountRequest(request api.MountRequest, validateSubPath bool) (api.MountRequest, error) {
-	driver := s.cfg.DriverName
-	if request.DriverName == node.JuiceFSDriver && s.cfg.JuiceFSSocket != "" {
-		driver = node.JuiceFSDriver
-	}
-	if err := validateRequestShape(driver, &request); err != nil {
+	if err := validateRequestShape(s.cfg.DriverName, &request); err != nil {
 		return request, err
 	}
 
@@ -414,7 +389,7 @@ func (s *Server) mountPlanForPod(ctx context.Context, request api.MountRequest, 
 	if err != nil {
 		return request, node.MountPlan{}, fmt.Errorf("get pv %s: %w", request.PVName, err)
 	}
-	if err := authorizePVForPod(request.DriverName, pod, pv); err != nil {
+	if err := authorizePVForPod(s.cfg.DriverName, pod, pv); err != nil {
 		return request, node.MountPlan{}, err
 	}
 
@@ -423,20 +398,10 @@ func (s *Server) mountPlanForPod(ctx context.Context, request api.MountRequest, 
 		return request, node.MountPlan{}, fmt.Errorf("%w: %v", errBadRequest, err)
 	}
 	request.ContainerName = containerStatus.Name
-	if request.DriverName == node.JuiceFSDriver {
-		if err := authorizeJuiceFSMount(pod, request); err != nil {
-			return request, node.MountPlan{}, err
-		}
-	}
 
 	plan, err := buildMountPlan(request, pod, pv, containerStatus.ContainerID)
 	if err != nil {
 		return request, node.MountPlan{}, err
-	}
-	if request.DriverName == node.JuiceFSDriver {
-		if err := s.loadJuiceFSSecrets(ctx, pv, &plan); err != nil {
-			return request, node.MountPlan{}, err
-		}
 	}
 	return request, plan, nil
 }
@@ -479,13 +444,4 @@ func bearerToken(header string) (string, error) {
 		return "", fmt.Errorf("empty bearer token")
 	}
 	return token, nil
-}
-
-// Mount Pod cold-start may include image pull and scheduling. Do not lengthen
-// NFS requests or Kubernetes API calls when opting into the JuiceFS backend.
-func (s *Server) operationTimeout(driver string) time.Duration {
-	if driver == node.JuiceFSDriver && s.cfg.JuiceFSMountMode == "mountpod" && s.cfg.JuiceFSRequestTimeout > 0 {
-		return s.cfg.JuiceFSRequestTimeout
-	}
-	return s.cfg.RequestTimeout
 }

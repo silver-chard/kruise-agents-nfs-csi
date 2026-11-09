@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -234,34 +233,6 @@ func TestUnauthorizedDesiredMountIsNotScheduledForRetry(t *testing.T) {
 	case retry := <-retries:
 		t.Fatalf("unexpected retry scheduled: %#v", retry)
 	default:
-	}
-}
-
-func TestCleanedStaleDesiredMountIsNotScheduledForRetry(t *testing.T) {
-	server, _, _, _ := newReconcileTestServer(t)
-	retries := make(chan reconcileRetry, 1)
-	desired := desiredMount{Request: testMountRequest()}
-	server.scheduleReconcileRetry(context.Background(), retries, desired, errDesiredMountStale)
-	select {
-	case retry := <-retries:
-		t.Fatalf("unexpected retry scheduled after stale state was removed: %#v", retry)
-	default:
-	}
-}
-
-func TestReleasedStaleMountDoesNotReleaseSourceTwice(t *testing.T) {
-	server, store, _, mounter := newReconcileTestServer(t)
-	desired := desiredMount{Request: testMountRequest(), ContainerID: "containerd://old-container"}
-	if err := store.Put(desired); err != nil {
-		t.Fatal(err)
-	}
-
-	server.handleReconcileResult(desired, fmt.Errorf("%w: %w", errDesiredMountStale, errDesiredMountSourceReleased))
-	if len(mounter.unmountCalls) != 0 {
-		t.Fatalf("unmount calls = %d, want 0 after detach already released the source", len(mounter.unmountCalls))
-	}
-	if _, exists := store.Get(desired.key()); exists {
-		t.Fatal("released stale desired mount was not deleted")
 	}
 }
 
@@ -808,7 +779,6 @@ type reconcileTestMounter struct {
 	mounted      map[string]bool
 	mountCalls   []node.MountPlan
 	unmountCalls []node.MountPlan
-	releaseCalls []node.MountPlan
 }
 
 func (m *reconcileTestMounter) Mount(_ context.Context, plan node.MountPlan) error {
@@ -825,11 +795,6 @@ func (m *reconcileTestMounter) Unmount(_ context.Context, plan node.MountPlan) e
 
 func (m *reconcileTestMounter) IsMounted(_ context.Context, plan node.MountPlan) (bool, error) {
 	return m.mounted[mounterKey(plan.ContainerID, plan.TargetPath)], nil
-}
-
-func (m *reconcileTestMounter) Release(_ context.Context, plan node.MountPlan) error {
-	m.releaseCalls = append(m.releaseCalls, plan)
-	return nil
 }
 
 func mounterKey(containerID, targetPath string) string {

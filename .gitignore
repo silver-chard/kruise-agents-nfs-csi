@@ -11,4 +11,3 @@
 *.tmp
 .idea
 .gocache
-build/vendor/
