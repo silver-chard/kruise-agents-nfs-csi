@@ -75,6 +75,7 @@ paths:
 wrapper:
   enableMount: true
   unstageAfterMount: true
+  requireBoundPVC: false
   createMissingSubPaths: false
   createdSubPathMode: "0770"
   socketGroup: 2000

@@ -106,6 +106,13 @@ type PersistentVolume struct {
 	Spec     PersistentVolumeSpec `json:"spec"`
 }
 
+type PersistentVolumeClaimResource struct {
+	Metadata ObjectMeta `json:"metadata"`
+	Spec     struct {
+		VolumeName string `json:"volumeName"`
+	} `json:"spec"`
+}
+
 type PersistentVolumeSpec struct {
 	ClaimRef     *ObjectReference           `json:"claimRef,omitempty"`
 	CSI          *CSIPersistentVolumeSource `json:"csi,omitempty"`

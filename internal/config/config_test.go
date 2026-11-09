@@ -104,3 +104,18 @@ func TestParseFileModeRejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadWrapperConfigRequireBoundPVC(t *testing.T) {
+	for _, tt := range []struct {
+		value         string
+		want, invalid bool
+	}{
+		{"", false, false}, {"true", true, false}, {"typo", false, true},
+	} {
+		t.Setenv("WRAPPER_REQUIRE_BOUND_PVC", tt.value)
+		cfg, err := LoadWrapperConfig()
+		if (err != nil) != tt.invalid || cfg.RequireBoundPVC != tt.want {
+			t.Fatalf("WRAPPER_REQUIRE_BOUND_PVC=%q: enabled=%t err=%v", tt.value, cfg.RequireBoundPVC, err)
+		}
+	}
+}

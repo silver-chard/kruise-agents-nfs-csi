@@ -12,6 +12,7 @@ import (
 
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/config"
+	"github.com/silver-chard/kruise-agents-nfs-csi/internal/keyedlock"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/kube"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/node"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/security"
@@ -22,6 +23,7 @@ type Kubernetes interface {
 	GetPod(ctx context.Context, namespace, name string) (*kube.Pod, error)
 	RunPodInformer(ctx context.Context, nodeName string, synced func([]kube.Pod), handle func(kube.PodWatchEvent)) error
 	GetPersistentVolume(ctx context.Context, name string) (*kube.PersistentVolume, error)
+	GetPersistentVolumeClaim(ctx context.Context, namespace, name string) (*kube.PersistentVolumeClaimResource, error)
 }
 
 type Server struct {
@@ -31,13 +33,11 @@ type Server struct {
 	state           mountStateStore
 	logger          *log.Logger
 	mux             *http.ServeMux
-	targetLocks     [targetLockStripes]sync.Mutex
+	targetLocks     keyedlock.Mutex[desiredMountKey]
 	reconcileErrors sync.Map
 	retrying        sync.Map
 	exportRoot      exportRootAuthorizer
 }
-
-const targetLockStripes = 128
 
 var errNodeOperation = errors.New("node operation failed")
 
@@ -153,9 +153,11 @@ func (s *Server) mount(ctx context.Context, token, exportRootKey string, request
 		return nil, err
 	}
 	key := desiredMountKeyFor(request)
-	lock := s.targetLock(key)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := s.targetLocks.Lock(ctx, key)
+	if err != nil {
+		return nil, errors.Join(errNodeOperation, err)
+	}
+	defer unlock()
 
 	previous, existed := s.state.Get(key)
 	isExportRoot := node.IsNFSExportRoot(plan)
@@ -244,9 +246,11 @@ func (s *Server) unmount(ctx context.Context, token string, request api.UnmountR
 	}
 	mountRequest.ContainerName = containerStatus.Name
 	key := desiredMountKeyFor(mountRequest)
-	lock := s.targetLock(key)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := s.targetLocks.Lock(ctx, key)
+	if err != nil {
+		return nil, errors.Join(errNodeOperation, err)
+	}
+	defer unlock()
 
 	previous, existed := s.state.Get(key)
 	if !existed {
@@ -317,17 +321,6 @@ func (s *Server) restoreDesiredMount(key desiredMountKey, previous desiredMount,
 	return nil
 }
 
-func (s *Server) targetLock(key desiredMountKey) *sync.Mutex {
-	hash := uint32(2166136261)
-	for _, value := range []string{key.PodUID, key.ContainerName, key.TargetPath} {
-		for i := 0; i < len(value); i++ {
-			hash ^= uint32(value[i])
-			hash *= 16777619
-		}
-	}
-	return &s.targetLocks[hash%targetLockStripes]
-}
-
 func (s *Server) authorizedMountPlan(ctx context.Context, token string, request api.MountRequest, validateSubPath bool) (api.MountRequest, node.MountPlan, error) {
 	request, err := s.normalizeMountRequest(request, validateSubPath)
 	if err != nil {
@@ -392,6 +385,11 @@ func (s *Server) mountPlanForPod(ctx context.Context, request api.MountRequest, 
 	if err := authorizePVForPod(s.cfg.DriverName, pod, pv); err != nil {
 		return request, node.MountPlan{}, err
 	}
+	if _, explicitNamespace := pv.Metadata.Annotations[allowNamespaceAnnotation]; s.cfg.RequireBoundPVC && !explicitNamespace {
+		if err := s.checkPVCBinding(ctx, pod.Metadata.Namespace, pv); err != nil {
+			return request, node.MountPlan{}, err
+		}
+	}
 
 	containerStatus, err := selectContainerStatus(pod, request.ContainerName)
 	if err != nil {
@@ -404,6 +402,21 @@ func (s *Server) mountPlanForPod(ctx context.Context, request api.MountRequest, 
 		return request, node.MountPlan{}, err
 	}
 	return request, plan, nil
+}
+
+func (s *Server) checkPVCBinding(ctx context.Context, namespace string, pv *kube.PersistentVolume) error {
+	ref := pv.Spec.ClaimRef
+	if ref == nil || ref.Namespace != namespace || ref.Name == "" || ref.UID == "" {
+		return fmt.Errorf("pv %s requires a PVC binding in namespace %s", pv.Metadata.Name, namespace)
+	}
+	pvc, err := s.kube.GetPersistentVolumeClaim(ctx, namespace, ref.Name)
+	if err != nil {
+		return fmt.Errorf("get PVC %s/%s for PV %s: %w", namespace, ref.Name, pv.Metadata.Name, err)
+	}
+	if pvc.Metadata.Namespace != namespace || pvc.Metadata.Name != ref.Name || pvc.Metadata.UID != ref.UID || pvc.Spec.VolumeName != pv.Metadata.Name {
+		return fmt.Errorf("PVC %s/%s does not match the binding for PV %s", namespace, ref.Name, pv.Metadata.Name)
+	}
+	return nil
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {

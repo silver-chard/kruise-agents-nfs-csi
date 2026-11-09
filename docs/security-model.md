@@ -57,8 +57,7 @@ containers should not be able to read PV objects through Kubernetes RBAC, and
 the mounter should receive mount configuration from the sandbox runtime CSI
 invocation instead of accepting arbitrary PV choices from the workload.
 
-The wrapper does not fetch a PVC and does not use the PV's `spec.claimRef` as
-an authorization boundary. This is intentional so one PV can be shared across
+By default, the wrapper uses PV annotations for storage authorization. This is intentional so one PV can be shared across
 namespaces, but it also means a bound PV is not protected by its claim
 namespace. Per-PV access is provided only by the annotation policy described
 below, in addition to the socket, exact-Pod token, driver, node, container, and
@@ -95,18 +94,20 @@ kary.dev/allow-serviceaccount: "runtime, workspace-agent"
 Each annotation is an independent comma-separated allowlist. Entries are
 trimmed and compared exactly and case-sensitively with the live Pod namespace
 or bare `spec.serviceAccountName`. When both annotations are present, both must
-match. A missing annotation makes only that dimension unrestricted; if both are
+match. In the default configuration a missing annotation makes that dimension unrestricted; if both are
 missing, the PV policy itself is unrestricted.
 
 An explicitly empty value, an empty item such as `a,,b` or `a,`, and `*` are
 invalid and cause authorization to fail. There is deliberately no wildcard;
 operators express an unrestricted dimension by omitting its annotation.
 
-Because missing annotations default to unrestricted and `claimRef` is ignored,
-every existing PV without these annotations becomes selectable across
-namespaces by any caller that passes the other wrapper checks. Kubernetes RBAC
-for creating or patching PVs and these annotations is therefore part of the
-storage security boundary.
+For clusters using namespace-scoped PVCs, enable `wrapper.requireBoundPVC`.
+When the namespace annotation is absent, the wrapper reads the referenced PVC
+in the live Pod namespace and checks both the claim UID and its bound PV name.
+The chart grants `get` on PVCs only when this option is enabled. Existing service
+account restrictions still apply. An explicit namespace allowlist authorizes
+shared and static PVs. Permission to patch PV annotations grants control over
+that access.
 
 Annotation changes apply to future mounts. They do not actively revoke or
 unmount a mount that already exists in an unchanged container namespace. If the

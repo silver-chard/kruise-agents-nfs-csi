@@ -203,7 +203,7 @@ func TestReconcileExportRootUsesCurrentOptionalKeyPolicy(t *testing.T) {
 				if len(mounter.mountCalls) != 0 {
 					t.Fatalf("mount calls = %d, want 0", len(mounter.mountCalls))
 				}
-				server.handleReconcileResult(desired, err)
+				server.handleReconcileResult(context.Background(), desired, err)
 				if _, exists := store.Get(desired.key()); !exists {
 					t.Fatal("blocked desired mount was deleted")
 				}
@@ -257,7 +257,7 @@ func TestMountUpgradesUnkeyedExportRootAuthorizationWithoutRemount(t *testing.T)
 	if !errors.Is(blockedErr, errDesiredMountUnauthorized) {
 		t.Fatalf("reconcile unkeyed state under keyed policy error = %v, want unauthorized", blockedErr)
 	}
-	server.handleReconcileResult(unkeyed, blockedErr)
+	server.handleReconcileResult(context.Background(), unkeyed, blockedErr)
 	if _, exists := store.Get(unkeyed.key()); !exists {
 		t.Fatal("unkeyed desired mount was deleted before it could be upgraded")
 	}
@@ -305,7 +305,7 @@ func TestReconcileRejectsLiveExportRootClassificationChange(t *testing.T) {
 	if len(mounter.mountCalls) != 0 {
 		t.Fatalf("mount calls = %d, want 0", len(mounter.mountCalls))
 	}
-	server.handleReconcileResult(desired, err)
+	server.handleReconcileResult(context.Background(), desired, err)
 	if _, exists := store.Get(desired.key()); !exists {
 		t.Fatal("blocked desired mount was deleted")
 	}
@@ -748,6 +748,8 @@ func testMountRequest() api.MountRequest {
 }
 
 type reconcileTestKube struct {
+	claimRead   bool
+	claim       *kube.PersistentVolumeClaimResource
 	tokenStatus *kube.TokenReviewStatus
 	pod         *kube.Pod
 	podErr      error
@@ -773,6 +775,14 @@ func (k *reconcileTestKube) RunPodInformer(ctx context.Context, _ string, synced
 
 func (k *reconcileTestKube) GetPersistentVolume(context.Context, string) (*kube.PersistentVolume, error) {
 	return k.pv, nil
+}
+
+func (k *reconcileTestKube) GetPersistentVolumeClaim(_ context.Context, namespace, name string) (*kube.PersistentVolumeClaimResource, error) {
+	k.claimRead = true
+	if k.claim == nil || k.claim.Metadata.Namespace != namespace || k.claim.Metadata.Name != name {
+		return nil, errors.New("PVC not found")
+	}
+	return k.claim, nil
 }
 
 type reconcileTestMounter struct {
