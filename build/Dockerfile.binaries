@@ -1,0 +1,3 @@
+FROM scratch
+COPY dist/linux-amd64/kruise-nfs-wrapper /kruise-nfs-wrapper
+COPY dist/linux-amd64/kruise-nfs-mounter /kruise-nfs-mounter

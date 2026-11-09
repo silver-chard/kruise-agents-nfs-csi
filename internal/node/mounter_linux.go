@@ -38,6 +38,9 @@ func (m *linuxMounter) Mount(ctx context.Context, plan MountPlan) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if plan.PV.Driver == JuiceFSDriver {
+		return m.mountJuiceFS(ctx, plan)
+	}
 	if plan.PV.Server == "" || plan.PV.Share == "" {
 		return fmt.Errorf("pv %s is missing nfs server or share attributes", plan.PV.Name)
 	}
@@ -85,6 +88,9 @@ func (m *linuxMounter) Unmount(ctx context.Context, plan MountPlan) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if plan.PV.Driver == JuiceFSDriver {
+		return m.unmountJuiceFS(ctx, plan)
+	}
 	if plan.ContainerID == "" {
 		return fmt.Errorf("container %s has empty container id", plan.ContainerName)
 	}
@@ -102,6 +108,9 @@ func (m *linuxMounter) IsMounted(ctx context.Context, plan MountPlan) (bool, err
 	}
 	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if plan.PV.Driver == JuiceFSDriver {
+		return m.isMountedJuiceFS(ctx, plan)
 	}
 	if plan.ContainerID == "" {
 		return false, fmt.Errorf("container %s has empty container id", plan.ContainerName)

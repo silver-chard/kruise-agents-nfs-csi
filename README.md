@@ -14,6 +14,13 @@ the CSI socket.
 The default CSI driver name is `csi.nfs.zhida`. Set the same `DRIVER_NAME` in
 the wrapper and mounter when a deployment uses a different name.
 
+The optional JuiceFS backend supports Manager-authorized read-only or writable
+directory views. See [JuiceFS source reuse and access modes](docs/juicefs-access-modes.md)
+for the request contract, kernel requirements, and source lifecycle.
+[Mount Pod mode](docs/juicefs-mountpod.md) separates FUSE lifetime from the CSI
+Node container when used with the required external CSI driver extension.
+The bundled NFS chart does not install or configure that JuiceFS driver.
+
 ## What's new in v1.1.1
 
 - The NFS export-root capability key is now an optional extra restriction.

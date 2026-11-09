@@ -15,9 +15,11 @@ type MountRequest struct {
 	SourceSubPath string `json:"source_sub_path,omitempty"`
 	TargetPath    string `json:"target_path"`
 	ContainerName string `json:"container_name,omitempty"`
+	ReadOnly      bool   `json:"read_only,omitempty"`
 }
 
 type MountResult struct {
+	ReadOnly      bool   `json:"read_only,omitempty"`
 	Mounted       bool   `json:"mounted"`
 	DriverName    string `json:"driver_name"`
 	PVName        string `json:"pv_name"`

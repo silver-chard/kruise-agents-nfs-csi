@@ -45,6 +45,7 @@ type Config struct {
 // MountRequest identifies a volume and target container for a mount operation.
 // The client supplies the wire API version and configured driver name.
 type MountRequest struct {
+	ReadOnly bool `json:"read_only,omitempty"`
 	// Namespace is the requesting Pod namespace.
 	Namespace string `json:"namespace"`
 	// PodName is the requesting Pod name.
@@ -63,6 +64,7 @@ type MountRequest struct {
 
 // MountResult reports the effective mount accepted by the node wrapper.
 type MountResult struct {
+	ReadOnly bool `json:"read_only,omitempty"`
 	// Mounted reports whether the wrapper completed the mount.
 	Mounted bool `json:"mounted"`
 	// DriverName is the driver accepted by the wrapper.
@@ -218,6 +220,7 @@ func (c *Client) Mount(ctx context.Context, request MountRequest) (*MountResult,
 		SourceSubPath: request.SourceSubPath,
 		TargetPath:    request.TargetPath,
 		ContainerName: request.ContainerName,
+		ReadOnly:      request.ReadOnly,
 	}
 	var result MountResult
 	if err := c.call(ctx, "mount", http.MethodPost, "/v1/mount", token, exportRootKey, payload, &result); err != nil {

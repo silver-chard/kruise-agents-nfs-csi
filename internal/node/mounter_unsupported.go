@@ -29,3 +29,7 @@ func (unsupportedMounter) Unmount(context.Context, MountPlan) error {
 func (unsupportedMounter) IsMounted(context.Context, MountPlan) (bool, error) {
 	return false, fmt.Errorf("node mount inspection is only supported on linux")
 }
+
+func ValidateJuiceFSConfig(mode, root, state string) error {
+	return fmt.Errorf("JuiceFS node mount is only supported on linux")
+}

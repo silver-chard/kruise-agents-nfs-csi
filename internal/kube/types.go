@@ -113,7 +113,19 @@ type PersistentVolumeSpec struct {
 }
 
 type CSIPersistentVolumeSource struct {
-	Driver           string            `json:"driver"`
-	VolumeHandle     string            `json:"volumeHandle"`
-	VolumeAttributes map[string]string `json:"volumeAttributes,omitempty"`
+	ReadOnly             bool              `json:"readOnly,omitempty"`
+	FSType               string            `json:"fsType,omitempty"`
+	NodePublishSecretRef *SecretReference  `json:"nodePublishSecretRef,omitempty"`
+	Driver               string            `json:"driver"`
+	VolumeHandle         string            `json:"volumeHandle"`
+	VolumeAttributes     map[string]string `json:"volumeAttributes,omitempty"`
+}
+
+type SecretReference struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+type Secret struct {
+	Data map[string][]byte `json:"data"`
 }

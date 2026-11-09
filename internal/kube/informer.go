@@ -90,6 +90,9 @@ func trimPodForInformerCache(object any) (any, error) {
 		},
 		Status: corev1.PodStatus{Phase: pod.Status.Phase},
 	}
+	if allowedMounts, ok := pod.Annotations["drive.juicefs.com/allowed-mounts"]; ok {
+		trimmed.Annotations = map[string]string{"drive.juicefs.com/allowed-mounts": allowedMounts}
+	}
 	for _, container := range pod.Spec.Containers {
 		cachedContainer := corev1.Container{Name: container.Name}
 		for _, env := range container.Env {
@@ -124,6 +127,9 @@ func podFromInformerObject(object any) (*corev1.Pod, bool) {
 }
 
 func sameContainerState(left, right *corev1.Pod) bool {
+	if left.Annotations["drive.juicefs.com/allowed-mounts"] != right.Annotations["drive.juicefs.com/allowed-mounts"] {
+		return false
+	}
 	if left.Status.Phase != right.Status.Phase || len(left.Status.ContainerStatuses) != len(right.Status.ContainerStatuses) {
 		return false
 	}

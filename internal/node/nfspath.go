@@ -30,5 +30,5 @@ func NormalizeNFSSubDir(value string) (string, error) {
 // IsNFSExportRoot reports whether a plan selects the configured NFS share
 // root instead of a PV or request subdirectory below it.
 func IsNFSExportRoot(plan MountPlan) bool {
-	return plan.PV.SubDir == "" && plan.SourceSubPath == ""
+	return plan.PV.Driver != JuiceFSDriver && plan.PV.SubDir == "" && plan.SourceSubPath == ""
 }
