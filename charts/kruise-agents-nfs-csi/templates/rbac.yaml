@@ -72,6 +72,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.wrapper.requireBoundPVC }}
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

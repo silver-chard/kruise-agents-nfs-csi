@@ -106,6 +106,7 @@ func bindWrapperFlags(flagSet *flag.FlagSet, cfg *config.WrapperConfig) {
 	flagSet.StringVar(&cfg.ExportRootKeyFile, "export-root-key-file", cfg.ExportRootKeyFile, "NFS export root capability key file")
 	flagSet.BoolVar(&cfg.EnableMount, "enable-mount", cfg.EnableMount, "enable real node mount operations")
 	flagSet.BoolVar(&cfg.UnstageAfterMount, "unstage-after-mount", cfg.UnstageAfterMount, "unmount wrapper staging source after each dynamic bind mount")
+	flagSet.BoolVar(&cfg.RequireBoundPVC, "require-bound-pvc", cfg.RequireBoundPVC, "require a matching live PVC for volumes without an explicit namespace allowlist")
 	flagSet.BoolVar(&cfg.CreateMissingSubPaths, "create-missing-subpaths", cfg.CreateMissingSubPaths, "create missing source subPath directories")
 	flagSet.Var(&fileModeValue{target: &cfg.CreatedSubPathMode}, "created-subpath-mode", "Unix mode for newly created source subPath directories")
 }

@@ -8,24 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 
+	"github.com/silver-chard/kruise-agents-nfs-csi/internal/keyedlock"
 	"golang.org/x/sys/unix"
 )
 
 type linuxMounter struct {
 	cfg          Config
-	stagingLocks [stagingLockStripes]sync.Mutex
+	stagingLocks keyedlock.Mutex[string]
 }
-
-const stagingLockStripes = 128
 
 func NewMounter(cfg Config) Mounter {
 	return &linuxMounter{cfg: cfg}
@@ -45,9 +42,11 @@ func (m *linuxMounter) Mount(ctx context.Context, plan MountPlan) error {
 		return fmt.Errorf("container %s has empty container id", plan.ContainerName)
 	}
 
-	lock := m.stagingLock(plan.PV.Name)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := m.stagingLocks.Lock(ctx, plan.PV.Name)
+	if err != nil {
+		return fmt.Errorf("wait for staging pv %s: %w", plan.PV.Name, err)
+	}
+	defer unlock()
 
 	stagePath := filepath.Join(m.cfg.StagingRoot, plan.PV.Name)
 	if m.cfg.UnstageAfterMount {
@@ -140,15 +139,6 @@ func (m *linuxMounter) bindMountWithLegacyAPI(targetPID int, stagePath, sourceSu
 	}
 	defer source.Close()
 	return legacyBindMountIntoContainerNamespace(m.cfg.HostProcRoot, targetPID, source.Path(), source.Description, targetPath)
-}
-
-func (m *linuxMounter) stagingLock(key string) *sync.Mutex {
-	hash := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		hash ^= uint32(key[i])
-		hash *= 16777619
-	}
-	return &m.stagingLocks[hash%stagingLockStripes]
 }
 
 func warnCleanupStagingPath(stagePath string) {
@@ -250,13 +240,20 @@ func mountNFS(ctx context.Context, pv PersistentVolume, target string) error {
 	}
 	args = append(args, source, target)
 
-	output, err := exec.CommandContext(ctx, "mount", args...).CombinedOutput()
+	output, err := runMountCommand(ctx, "mount", args...)
 	if err != nil {
 		detail := strings.TrimSpace(string(output))
 		if detail != "" {
 			return fmt.Errorf("mount nfs source for pv %s: %w: %s", pv.Name, err, detail)
 		}
 		return fmt.Errorf("mount nfs source for pv %s: %w", pv.Name, err)
+	}
+	// A helper can exit successfully after starting a background retry. It
+	// must not make an ordinary staging directory look like a mounted PV.
+	if mounted, err := isMountPoint("/proc/self/mountinfo", target); err != nil {
+		return err
+	} else if !mounted {
+		return fmt.Errorf("mount nfs source for pv %s exited without mounting the staging path", pv.Name)
 	}
 	return nil
 }

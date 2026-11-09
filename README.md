@@ -83,9 +83,9 @@ All three integration styles require:
 - Pod namespace, name, and UID from the Downward API; and
 - the target container name, or an unambiguous target container.
 
-The wrapper does not require a PVC and does not use `spec.claimRef` for
-authorization. A bound PV can therefore be selected from another namespace
-when its annotation policy allows the target Pod.
+By default, the wrapper uses PV annotations to authorize a mount. A cluster that
+relies on namespace-scoped PVC bindings can enable `wrapper.requireBoundPVC`.
+See [PV annotation authorization](#pv-annotation-authorization) for its exact scope.
 
 Do not mount the wrapper socket or its projected token into untrusted workload
 code. See [Security Model](docs/security-model.md) for the full trust boundary.
@@ -192,7 +192,7 @@ metadata:
 Each value is a comma-separated allowlist. Surrounding whitespace is ignored,
 but matching is otherwise exact and case-sensitive. Service account entries are
 bare names, not `namespace/name` values. If both annotations are present, both
-must allow the live target Pod. Omitting one annotation leaves that dimension
+must allow the live target Pod. In the default configuration, omitting one annotation leaves that dimension
 unrestricted; omitting both allows every namespace and service account that
 passes the socket, projected-token, live-Pod, node, driver, container, and path
 checks.
@@ -201,11 +201,13 @@ An annotation that is present but empty is not the same as an omitted
 annotation. Empty list items, including a trailing comma, and `*` are invalid
 and fail closed. Use omission, not a wildcard, to make a dimension unrestricted.
 
-This policy replaces the previous PVC/`claimRef` authorization. The wrapper
-does not fetch the PVC and does not compare the PV's `claimRef` namespace or
-UID. Consequently, an existing PV without either allowlist is available across
-namespaces to every otherwise authorized caller. Treat permission to create or
-patch these PV annotations as storage-access administration.
+With `wrapper.requireBoundPVC=true` (`WRAPPER_REQUIRE_BOUND_PVC=true`), a PV
+without a namespace allowlist must have a claimRef in the target Pod namespace.
+The wrapper gets that one PVC and verifies its name, namespace, UID and bound
+PV name for both initial mounts and reconciliation. A service-account-only
+allowlist adds a restriction within the bound namespace. An explicit namespace
+allowlist continues to support sharing and static PVs. Treat permission to
+patch these annotations as storage-access administration.
 
 Changing an annotation does not immediately unmount an established mount. The
 new policy is applied to new mount requests and when a changed container ID

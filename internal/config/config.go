@@ -41,6 +41,7 @@ type WrapperConfig struct {
 	RequestTimeout        time.Duration
 	EnableMount           bool
 	UnstageAfterMount     bool
+	RequireBoundPVC       bool
 	CreateMissingSubPaths bool
 	CreatedSubPathMode    os.FileMode
 	ExportRootKeyFile     string
@@ -64,19 +65,24 @@ func LoadWrapperConfig() (WrapperConfig, error) {
 		return WrapperConfig{}, err
 	}
 
+	requireBoundPVC, err := strconv.ParseBool(Env("WRAPPER_REQUIRE_BOUND_PVC", "false"))
+	if err != nil {
+		return WrapperConfig{}, fmt.Errorf("invalid WRAPPER_REQUIRE_BOUND_PVC: %w", err)
+	}
 	return WrapperConfig{
-		DriverName:     Env("DRIVER_NAME", DefaultDriverName),
-		SocketPath:     Env("WRAPPER_SOCKET_PATH", DefaultSocketPath),
-		SocketMode:     FileModeEnv("WRAPPER_SOCKET_MODE", 0o660),
-		TokenAudience:  Env("TOKEN_AUDIENCE", DefaultTokenAudience),
-		KubeTokenFile:  Env("KUBE_TOKEN_FILE", DefaultKubeTokenFile),
-		KubeCAFile:     Env("KUBE_CA_FILE", DefaultKubeCAFile),
-		StagingRoot:    Env("WRAPPER_STAGING_ROOT", DefaultStagingRoot),
-		MountStateDir:  Env("WRAPPER_MOUNT_STATE_DIR", DefaultMountStateDir),
-		NodeName:       Env("WRAPPER_NODE_NAME", Env("NODE_ID", Env("KUBE_NODE_NAME", ""))),
-		HostProcRoot:   Env("WRAPPER_HOST_PROC_ROOT", DefaultHostProcRoot),
-		RequestTimeout: DurationEnv("WRAPPER_REQUEST_TIMEOUT", 30*time.Second),
-		EnableMount:    BoolEnv("WRAPPER_ENABLE_MOUNT", true),
+		RequireBoundPVC: requireBoundPVC,
+		DriverName:      Env("DRIVER_NAME", DefaultDriverName),
+		SocketPath:      Env("WRAPPER_SOCKET_PATH", DefaultSocketPath),
+		SocketMode:      FileModeEnv("WRAPPER_SOCKET_MODE", 0o660),
+		TokenAudience:   Env("TOKEN_AUDIENCE", DefaultTokenAudience),
+		KubeTokenFile:   Env("KUBE_TOKEN_FILE", DefaultKubeTokenFile),
+		KubeCAFile:      Env("KUBE_CA_FILE", DefaultKubeCAFile),
+		StagingRoot:     Env("WRAPPER_STAGING_ROOT", DefaultStagingRoot),
+		MountStateDir:   Env("WRAPPER_MOUNT_STATE_DIR", DefaultMountStateDir),
+		NodeName:        Env("WRAPPER_NODE_NAME", Env("NODE_ID", Env("KUBE_NODE_NAME", ""))),
+		HostProcRoot:    Env("WRAPPER_HOST_PROC_ROOT", DefaultHostProcRoot),
+		RequestTimeout:  DurationEnv("WRAPPER_REQUEST_TIMEOUT", 30*time.Second),
+		EnableMount:     BoolEnv("WRAPPER_ENABLE_MOUNT", true),
 		UnstageAfterMount: BoolEnv(
 			"WRAPPER_UNSTAGE_AFTER_MOUNT",
 			true,

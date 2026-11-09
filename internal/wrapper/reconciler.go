@@ -95,14 +95,14 @@ func (s *Server) reconcilePodSnapshot(ctx context.Context, pods []kube.Pod, retr
 				err = fmt.Errorf("get pod %s/%s missing from node snapshot: %w", desired.Request.Namespace, desired.Request.PodName, err)
 			}
 			cancel()
-			s.handleReconcileResult(desired, err)
+			s.handleReconcileResult(ctx, desired, err)
 			s.scheduleReconcileRetry(ctx, retries, desired, err)
 			continue
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		err := s.reconcileMountForPod(requestCtx, desired, pod)
 		cancel()
-		s.handleReconcileResult(desired, err)
+		s.handleReconcileResult(ctx, desired, err)
 		s.scheduleReconcileRetry(ctx, retries, desired, err)
 	}
 }
@@ -115,13 +115,13 @@ func (s *Server) reconcilePodEvent(ctx context.Context, event kube.PodWatchEvent
 	}
 	for _, desired := range s.state.ListForPod(podKey) {
 		if event.Type == "DELETED" {
-			s.handleReconcileResult(desired, fmt.Errorf("%w: pod %s/%s was deleted", errDesiredMountStale, desired.Request.Namespace, desired.Request.PodName))
+			s.handleReconcileResult(ctx, desired, fmt.Errorf("%w: pod %s/%s was deleted", errDesiredMountStale, desired.Request.Namespace, desired.Request.PodName))
 			continue
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		err := s.reconcileMountForPod(requestCtx, desired, &event.Pod)
 		cancel()
-		s.handleReconcileResult(desired, err)
+		s.handleReconcileResult(ctx, desired, err)
 		if len(retries) != 0 {
 			s.scheduleReconcileRetry(ctx, retries[0], desired, err)
 		}
@@ -163,7 +163,7 @@ func (s *Server) processReconcileRetries(ctx context.Context, retries chan recon
 			requestCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 			err := s.reconcileMount(requestCtx, desired)
 			cancel()
-			s.handleReconcileResult(desired, err)
+			s.handleReconcileResult(ctx, desired, err)
 			if err == nil || errors.Is(err, errDesiredMountStale) || errors.Is(err, errDesiredMountUnauthorized) || retry.attempt+1 >= len(reconcileRetryDelays) {
 				s.retrying.Delete(retry.key)
 				continue
@@ -226,25 +226,30 @@ func (s *Server) reconcileAll(ctx context.Context) {
 			err = s.reconcileMountForPod(requestCtx, desired, podState.pod)
 		}
 		cancel()
-		s.handleReconcileResult(desired, err)
+		s.handleReconcileResult(ctx, desired, err)
 	}
 }
 
-func (s *Server) handleReconcileResult(desired desiredMount, err error) {
+func (s *Server) handleReconcileResult(ctx context.Context, desired desiredMount, err error) {
 	key := desired.key()
 	if err == nil {
 		s.reconcileErrors.Delete(key)
 		return
 	}
 	if errors.Is(err, errDesiredMountStale) {
-		lock := s.targetLock(key)
-		lock.Lock()
+		lockCtx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
+		unlock, lockErr := s.targetLocks.Lock(lockCtx, key)
+		cancel()
+		if lockErr != nil {
+			s.logReconcileError(key, desired, errors.Join(err, fmt.Errorf("wait to delete stale desired mount: %w", lockErr)))
+			return
+		}
 		current, exists := s.state.Get(key)
 		var deleteErr error
 		if exists && current == desired {
 			deleteErr = s.state.Delete(key)
 		}
-		lock.Unlock()
+		unlock()
 		if deleteErr == nil && exists && current == desired {
 			s.reconcileErrors.Delete(key)
 			s.logger.Printf("removed stale desired mount for pod %s/%s container %s at %s: %v", desired.Request.Namespace, desired.Request.PodName, desired.Request.ContainerName, desired.Request.TargetPath, err)
@@ -272,9 +277,11 @@ func (s *Server) reconcileMount(ctx context.Context, snapshot desiredMount) erro
 
 func (s *Server) reconcileMountForPod(ctx context.Context, snapshot desiredMount, pod *kube.Pod) error {
 	key := snapshot.key()
-	lock := s.targetLock(key)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, err := s.targetLocks.Lock(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	current, exists := s.state.Get(key)
 	if !exists || current != snapshot {

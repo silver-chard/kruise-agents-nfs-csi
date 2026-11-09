@@ -110,6 +110,15 @@ func (c *Client) GetPod(ctx context.Context, namespace, name string) (*Pod, erro
 	return &pod, nil
 }
 
+func (c *Client) GetPersistentVolumeClaim(ctx context.Context, namespace, name string) (*PersistentVolumeClaimResource, error) {
+	var claim PersistentVolumeClaimResource
+	resourcePath := path.Join("/api/v1/namespaces", namespace, "persistentvolumeclaims", name)
+	if err := c.do(ctx, http.MethodGet, resourcePath, nil, &claim); err != nil {
+		return nil, err
+	}
+	return &claim, nil
+}
+
 func (c *Client) GetPersistentVolume(ctx context.Context, name string) (*PersistentVolume, error) {
 	var pv PersistentVolume
 	resourcePath := path.Join("/api/v1/persistentvolumes", name)
