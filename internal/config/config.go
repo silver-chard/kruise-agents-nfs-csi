@@ -44,6 +44,12 @@ type WrapperConfig struct {
 	CreateMissingSubPaths bool
 	CreatedSubPathMode    os.FileMode
 	ExportRootKeyFile     string
+	JuiceFSRequestTimeout time.Duration
+	JuiceFSMountMode      string
+	JuiceFSSocket         string
+	JuiceFSPublishRoot    string
+	JuiceFSStateDir       string
+	JuiceFSSecretRefs     string
 }
 
 type MounterConfig struct {
@@ -84,6 +90,12 @@ func LoadWrapperConfig() (WrapperConfig, error) {
 		CreateMissingSubPaths: BoolEnv("WRAPPER_CREATE_MISSING_SUBPATHS", false),
 		CreatedSubPathMode:    createdSubPathMode,
 		ExportRootKeyFile:     Env("WRAPPER_EXPORT_ROOT_KEY_FILE", DefaultExportRootKeyFile),
+		JuiceFSRequestTimeout: DurationEnv("WRAPPER_JUICEFS_REQUEST_TIMEOUT", 180*time.Second),
+		JuiceFSMountMode:      Env("WRAPPER_JUICEFS_MOUNT_MODE", "process"),
+		JuiceFSSocket:         Env("WRAPPER_JUICEFS_CSI_SOCKET", ""),
+		JuiceFSPublishRoot:    Env("WRAPPER_JUICEFS_PUBLISH_ROOT", "/var/lib/kruise-agents-nfs-csi/juicefs-publish"),
+		JuiceFSStateDir:       Env("WRAPPER_JUICEFS_STATE_DIR", "/var/lib/kruise-agents-nfs-csi/juicefs-state"),
+		JuiceFSSecretRefs:     Env("WRAPPER_JUICEFS_SECRET_REFS", ""),
 	}, nil
 }
 

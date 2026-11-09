@@ -27,6 +27,11 @@ func main() {
 
 	bindWrapperFlags(flag.CommandLine, &cfg)
 	flag.Parse()
+	if cfg.JuiceFSSocket != "" {
+		if err := node.ValidateJuiceFSConfig(cfg.JuiceFSMountMode, cfg.JuiceFSPublishRoot, cfg.JuiceFSStateDir); err != nil {
+			log.Fatalf("invalid JuiceFS config: %v", err)
+		}
+	}
 
 	logger := log.New(os.Stdout, "kruise-nfs-wrapper ", log.LstdFlags|log.LUTC)
 
@@ -44,6 +49,10 @@ func main() {
 		CreateMissingSubPaths: cfg.CreateMissingSubPaths,
 		CreatedSubPathMode:    cfg.CreatedSubPathMode,
 		Timeout:               cfg.RequestTimeout,
+		JuiceFSMountMode:      cfg.JuiceFSMountMode,
+		JuiceFSSocket:         cfg.JuiceFSSocket,
+		JuiceFSPublishRoot:    cfg.JuiceFSPublishRoot,
+		JuiceFSStateDir:       cfg.JuiceFSStateDir,
 	})
 	if cfg.UnstageAfterMount {
 		if err := node.CleanupStagingRoot(cfg.StagingRoot); err != nil {
@@ -94,6 +103,11 @@ func main() {
 }
 
 func bindWrapperFlags(flagSet *flag.FlagSet, cfg *config.WrapperConfig) {
+	flagSet.StringVar(&cfg.JuiceFSMountMode, "juicefs-mount-mode", cfg.JuiceFSMountMode, "process or mountpod (requires wrapper-target CSI patch); never change with active leases")
+	flagSet.StringVar(&cfg.JuiceFSSocket, "juicefs-csi-socket", cfg.JuiceFSSocket, "trusted JuiceFS CSI Unix socket; empty disables JuiceFS")
+	flagSet.StringVar(&cfg.JuiceFSPublishRoot, "juicefs-publish-root", cfg.JuiceFSPublishRoot, "wrapper-owned CSI publish root, outside kubelet-managed Pod volumes")
+	flagSet.StringVar(&cfg.JuiceFSStateDir, "juicefs-state-dir", cfg.JuiceFSStateDir, "persistent CSI source lease directory")
+	flagSet.StringVar(&cfg.JuiceFSSecretRefs, "juicefs-secret-refs", cfg.JuiceFSSecretRefs, "comma-separated allowed namespace/name Secret references")
 	flagSet.StringVar(&cfg.DriverName, "driver-name", cfg.DriverName, "CSI driver name")
 	flagSet.StringVar(&cfg.SocketPath, "socket-path", cfg.SocketPath, "Unix socket path")
 	flagSet.StringVar(&cfg.TokenAudience, "token-audience", cfg.TokenAudience, "projected service account token audience")

@@ -119,6 +119,16 @@ func (c *Client) GetPersistentVolume(ctx context.Context, name string) (*Persist
 	return &pv, nil
 }
 
+// GetSecret is only called after the wrapper checked the PV's reference against
+// an operator-maintained namespace/name allowlist. Secret data is never persisted.
+func (c *Client) GetSecret(ctx context.Context, namespace, name string) (*Secret, error) {
+	var secret Secret
+	if err := c.do(ctx, http.MethodGet, path.Join("/api/v1/namespaces", namespace, "secrets", name), nil, &secret); err != nil {
+		return nil, err
+	}
+	return &secret, nil
+}
+
 func (c *Client) do(ctx context.Context, method, resourcePath string, in, out any) error {
 	var body io.Reader
 	if in != nil {

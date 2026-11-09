@@ -1,0 +1,6 @@
+# Overlay updated binaries on an explicitly selected, compatible mounter base.
+# This does not build or patch the separate JuiceFS CSI driver image.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY dist/linux-amd64/kruise-nfs-wrapper /usr/local/bin/kruise-nfs-wrapper
+COPY dist/linux-amd64/kruise-nfs-mounter /usr/local/bin/kruise-nfs-mounter

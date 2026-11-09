@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/api"
 	"github.com/silver-chard/kruise-agents-nfs-csi/internal/config"
@@ -32,6 +33,10 @@ func main() {
 		exitError(err)
 	}
 
+	// Only JuiceFS cold starts get a longer default; explicit caller limits win.
+	if request.Mount.DriverName == "csi.juicefs.com" && os.Getenv("MOUNTER_HTTP_TIMEOUT") == "" {
+		cfg.HTTPTimeout = 180 * time.Second
+	}
 	httpTimeout := cfg.HTTPTimeout
 	if httpTimeout < 0 {
 		httpTimeout = 0
@@ -166,6 +171,7 @@ func newRootCommand(state *commandState) *cobra.Command {
 }
 
 func bindCommonFlags(command *cobra.Command, state *commandState) {
+	command.Flags().BoolVar(&state.request.ReadOnly, "read-only", false, "mount the target read-only (JuiceFS mode must match the Manager grant)")
 	command.Flags().StringVar(&state.cfg.SocketPath, "socket-path", state.cfg.SocketPath, "wrapper Unix socket path")
 	command.Flags().StringVar(&state.cfg.TokenFile, "token-file", state.cfg.TokenFile, "projected service account token file")
 	command.Flags().StringVar(&state.cfg.ExportRootKeyFile, "export-root-key-file", state.cfg.ExportRootKeyFile, "optional NFS export root capability key file")
@@ -189,6 +195,7 @@ func applyNodePublishConfig(request *api.MountRequest, encodedConfig string, inc
 		request.SourceSubPath = sourceSubPathFromNodePublishRequest(csiRequest)
 	}
 	request.TargetPath = csiRequest.TargetPath
+	request.ReadOnly = csiRequest.Readonly
 	return nil
 }
 
@@ -314,6 +321,7 @@ func callMounter(ctx context.Context, client *mounter.Client, request cliRequest
 			SourceSubPath: request.Mount.SourceSubPath,
 			TargetPath:    request.Mount.TargetPath,
 			ContainerName: request.Mount.ContainerName,
+			ReadOnly:      request.Mount.ReadOnly,
 		})
 	case operationUnmount:
 		return client.Unmount(ctx, mounter.UnmountRequest{

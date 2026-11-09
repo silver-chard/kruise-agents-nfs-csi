@@ -1,0 +1,13 @@
+# Test-only offline packaging. Supply a trusted runtime image with the NFS
+# utilities and a separately verified /nfsplugin binary at build/vendor/nfsplugin.
+# Do not commit the vendor binary or copy it from an unverified source.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+COPY build/vendor/nfsplugin /nfsplugin
+COPY dist/linux-amd64/kruise-nfs-wrapper /usr/local/bin/kruise-nfs-wrapper
+COPY dist/linux-amd64/kruise-nfs-mounter /usr/local/bin/kruise-nfs-mounter
+COPY build/wrapper/entrypoint.sh /entrypoint.sh
+RUN chmod 0755 /nfsplugin /entrypoint.sh /usr/local/bin/kruise-nfs-wrapper /usr/local/bin/kruise-nfs-mounter
+ENTRYPOINT ["/entrypoint.sh"]
+CMD []

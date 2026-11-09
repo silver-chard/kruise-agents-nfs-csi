@@ -1,0 +1,13 @@
+# Build binaries first with Go >= 1.26.3; the image build downloads no toolchain.
+# This test image contains both node wrapper and unprivileged sidecar CLI.
+# Pass --build-arg BASE_IMAGE=<trusted Debian-compatible runtime image>.
+# Production may set BASE_IMAGE to its existing NFS wrapper image instead.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends nfs-common \
+    && rm -rf /var/lib/apt/lists/*
+COPY dist/linux-amd64/kruise-nfs-wrapper /usr/local/bin/kruise-nfs-wrapper
+COPY dist/linux-amd64/kruise-nfs-mounter /usr/local/bin/kruise-nfs-mounter
+ENTRYPOINT ["/usr/local/bin/kruise-nfs-wrapper"]
+CMD []
