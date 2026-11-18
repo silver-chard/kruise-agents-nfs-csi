@@ -8,10 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -228,8 +226,6 @@ func injectDirectory(procRoot string, pid int, stage, subpath, target string, re
 	}
 	modernAccessMode := false
 	rootFD := -1
-	selfRootFD := -1
-	selfCWDfd := -1
 	if modern {
 		defer unix.Close(tree)
 		attrs := unix.MountAttr{Attr_clr: unix.MOUNT_ATTR_RDONLY}
@@ -248,16 +244,6 @@ func injectDirectory(procRoot string, pid int, stage, subpath, target string, re
 				return fmt.Errorf("open target root for modern remount: %w", err)
 			}
 			defer unix.Close(rootFD)
-			selfRootFD, err = unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-			if err != nil {
-				return fmt.Errorf("open wrapper root for modern remount: %w", err)
-			}
-			defer unix.Close(selfRootFD)
-			selfCWDfd, err = unix.Open(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-			if err != nil {
-				return fmt.Errorf("open wrapper cwd for modern remount: %w", err)
-			}
-			defer unix.Close(selfCWDfd)
 		} else {
 			modernAccessMode = true
 		}
@@ -274,7 +260,6 @@ func injectDirectory(procRoot string, pid int, stage, subpath, target string, re
 				if err := enterRoot(rootFD); err != nil {
 					return err
 				}
-				defer restoreRoot(selfRootFD, selfCWDfd)
 			}
 			if err := unix.MoveMount(tree, "", targetFD, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
 				return err
@@ -366,63 +351,10 @@ func unmountJuiceFSTargetWithFlags(procRoot string, pid int, target string, flag
 		return err
 	}
 	defer unix.Close(rootFD)
-	selfRootFD, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(selfRootFD)
-	selfCWDfd, err := unix.Open(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(selfCWDfd)
 	return inMountNamespace(procRoot, pid, func() error {
 		if err := enterRoot(rootFD); err != nil {
 			return err
 		}
-		defer restoreRoot(selfRootFD, selfCWDfd)
 		return unix.Unmount(target, flags)
 	})
-}
-
-// If namespace restoration fails, the goroutine exits while locked so Go
-// destroys this OS thread; it must never return to the scheduler contaminated.
-func inMountNamespace(procRoot string, pid int, fn func() error) error {
-	ch := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		unlock := true
-		defer func() {
-			if unlock {
-				runtime.UnlockOSThread()
-			}
-		}()
-		if err := unshareFS(); err != nil {
-			ch <- err
-			return
-		}
-		self, err := os.Open(filepath.Join(procRoot, "thread-self/ns/mnt"))
-		if err != nil {
-			ch <- err
-			return
-		}
-		defer self.Close()
-		ns, err := os.Open(filepath.Join(procRoot, strconv.Itoa(pid), "ns/mnt"))
-		if err != nil {
-			ch <- err
-			return
-		}
-		defer ns.Close()
-		if err := setns(int(ns.Fd()), syscall.CLONE_NEWNS); err != nil {
-			ch <- err
-			return
-		}
-		result := fn()
-		if err := setns(int(self.Fd()), syscall.CLONE_NEWNS); err != nil {
-			unlock = false
-			result = errors.Join(result, fmt.Errorf("restore mount namespace: %w", err))
-		}
-		ch <- result
-	}()
-	return <-ch
 }
