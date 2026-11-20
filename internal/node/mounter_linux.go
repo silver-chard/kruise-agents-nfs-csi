@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -472,34 +471,12 @@ func moveMountIntoContainerNamespace(procRoot string, targetPID, sourceFD int, s
 	}
 	defer unix.Close(targetFD)
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := unshareFS(); err != nil {
-		return fmt.Errorf("unshare filesystem attributes: %w", err)
-	}
-
-	selfMountNS, err := os.Open(filepath.Join(procRoot, "self", "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open current mount namespace: %w", err)
-	}
-	defer selfMountNS.Close()
-
-	targetMountNS, err := os.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer targetMountNS.Close()
-
-	if err := setns(int(targetMountNS.Fd()), syscall.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("enter target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
-
-	if err := unix.MoveMount(sourceFD, "", targetFD, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
-		return fmt.Errorf("bind mount pv source %s to %s: %w", sourceDescription, targetPath, err)
-	}
-	return nil
+	return inMountNamespace(procRoot, targetPID, func() error {
+		if err := unix.MoveMount(sourceFD, "", targetFD, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
+			return fmt.Errorf("bind mount pv source %s to %s: %w", sourceDescription, targetPath, err)
+		}
+		return nil
+	})
 }
 
 func unmountInContainerNamespace(procRoot string, targetPID int, targetPath string) error {
@@ -516,51 +493,15 @@ func unmountInContainerNamespace(procRoot string, targetPID int, targetPath stri
 	}
 	defer unix.Close(targetRoot)
 
-	selfRoot, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("open current root: %w", err)
-	}
-	defer unix.Close(selfRoot)
-
-	selfCWD, err := unix.Open(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("open current working directory: %w", err)
-	}
-	defer unix.Close(selfCWD)
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := unshareFS(); err != nil {
-		return fmt.Errorf("unshare filesystem attributes: %w", err)
-	}
-
-	selfMountNS, err := os.Open(filepath.Join(procRoot, "self", "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open current mount namespace: %w", err)
-	}
-	defer selfMountNS.Close()
-
-	targetMountNS, err := os.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer targetMountNS.Close()
-
-	if err := setns(int(targetMountNS.Fd()), syscall.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("enter target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
-
-	if err := enterRoot(targetRoot); err != nil {
-		return fmt.Errorf("enter target root for pid %d: %w", targetPID, err)
-	}
-	defer restoreRoot(selfRoot, selfCWD)
-
-	if err := unix.Unmount(targetPath, 0); err != nil {
-		return fmt.Errorf("unmount target path %s: %w", targetPath, err)
-	}
-	return nil
+	return inMountNamespace(procRoot, targetPID, func() error {
+		if err := enterRoot(targetRoot); err != nil {
+			return fmt.Errorf("enter target root for pid %d: %w", targetPID, err)
+		}
+		if err := unix.Unmount(targetPath, 0); err != nil {
+			return fmt.Errorf("unmount target path %s: %w", targetPath, err)
+		}
+		return nil
+	})
 }
 
 func enterRoot(rootFD int) error {
@@ -574,20 +515,6 @@ func enterRoot(rootFD int) error {
 		return fmt.Errorf("change directory to /: %w", err)
 	}
 	return nil
-}
-
-func restoreRoot(rootFD, cwdFD int) {
-	if err := unix.Fchdir(rootFD); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore root directory: %v\n", err)
-		return
-	}
-	if err := unix.Chroot("."); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore root: %v\n", err)
-		return
-	}
-	if err := unix.Fchdir(cwdFD); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore working directory: %v\n", err)
-	}
 }
 
 func legacyBindMountIntoContainerNamespace(procRoot string, targetPID int, sourcePath, sourceDescription, targetPath string) error {
@@ -608,34 +535,12 @@ func legacyBindMountIntoContainerNamespace(procRoot string, targetPID int, sourc
 		return fmt.Errorf("target path %s is already a mount point", targetPath)
 	}
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := unshareFS(); err != nil {
-		return fmt.Errorf("unshare filesystem attributes: %w", err)
-	}
-
-	selfMountNS, err := os.Open(filepath.Join(procRoot, "self", "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open current mount namespace: %w", err)
-	}
-	defer selfMountNS.Close()
-
-	targetMountNS, err := os.Open(filepath.Join(procRoot, strconv.Itoa(targetPID), "ns", "mnt"))
-	if err != nil {
-		return fmt.Errorf("open target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer targetMountNS.Close()
-
-	if err := setns(int(targetMountNS.Fd()), syscall.CLONE_NEWNS); err != nil {
-		return fmt.Errorf("enter target mount namespace for pid %d: %w", targetPID, err)
-	}
-	defer setns(int(selfMountNS.Fd()), syscall.CLONE_NEWNS)
-
-	if err := unix.Mount(sourcePath, targetInContainerRoot, "", unix.MS_BIND, ""); err != nil {
-		return fmt.Errorf("bind mount pv source %s to %s with legacy mount API: %w", sourceDescription, targetPath, err)
-	}
-	return nil
+	return inMountNamespace(procRoot, targetPID, func() error {
+		if err := unix.Mount(sourcePath, targetInContainerRoot, "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind mount pv source %s to %s with legacy mount API: %w", sourceDescription, targetPath, err)
+		}
+		return nil
+	})
 }
 
 func setns(fd int, nstype int) error {
